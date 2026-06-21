@@ -30,6 +30,11 @@ func sportarrCanonicalPath(baseURL, imageURL string) string {
 	if strings.HasPrefix(imageURL, baseURL) {
 		return "sportarr://" + strings.TrimPrefix(imageURL, baseURL)
 	}
+	// The Sportarr image API returns root-relative paths (e.g. /static/images/…);
+	// canonicalize them too so ResolveImageURL can rebuild a fetchable URL.
+	if strings.HasPrefix(imageURL, "/") {
+		return "sportarr://" + imageURL
+	}
 	return imageURL
 }
 
