@@ -35,6 +35,7 @@ func TestSportarrCanonicalPath(t *testing.T) {
 	}{
 		{"empty", "", ""},
 		{"full url", "https://sportarr.net/api/images/abc123", "sportarr:///api/images/abc123"},
+		{"relative static path", "/static/images/league/9a/poster.jpg", "sportarr:///static/images/league/9a/poster.jpg"},
 		{"external url", "https://example.com/image.jpg", "https://example.com/image.jpg"},
 	}
 
@@ -46,6 +47,34 @@ func TestSportarrCanonicalPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCanonicalRoundTrip ensures both absolute and root-relative image URLs the
+// Sportarr API returns survive the canonicalize→store→resolve round trip and
+// come back as fetchable absolute URLs.
+func TestCanonicalRoundTrip(t *testing.T) {
+	base := "https://sportarr.net"
+
+	inputs := []string{
+		"https://sportarr.net/static/images/league/9a/poster.jpg",
+		"/static/images/league/9a/badge.png",
+	}
+	for _, in := range inputs {
+		canonical := sportarrCanonicalPath(base, in)
+		resolved := resolveOneSportarrPath(base, canonical, "")
+		if resolved != "https://sportarr.net/static/images/league/9a/"+lastSeg(in) {
+			t.Errorf("round trip for %q: canonical=%q resolved=%q", in, canonical, resolved)
+		}
+	}
+}
+
+func lastSeg(s string) string {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == '/' {
+			return s[i+1:]
+		}
+	}
+	return s
 }
 
 func TestResolveOneSportarrPath(t *testing.T) {
