@@ -25,10 +25,11 @@
       "description": "Sportarr — metadata for sports leagues as TV shows.",
       "metadata": {
         "default_priority": {
-          "series": 1,
-          "season": 1,
-          "episode": 1
-        }
+          "series": 50,
+          "season": 50,
+          "episode": 50
+        },
+        "default_enabled": false
       }
     }
   ],
