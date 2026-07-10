@@ -21,4 +21,4 @@ Metadata provided by [Sportarr](https://sportarr.net).
 
 ## License
 
-`silo-plugin-sportarr` is licensed under `AGPL-3.0-or-later`. See [LICENSE](LICENSE).
+`silo-plugins-metadata-sportarr` is licensed under `AGPL-3.0-or-later`. See [LICENSE](LICENSE).

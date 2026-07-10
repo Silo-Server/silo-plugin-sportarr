@@ -9,9 +9,9 @@
     "description_markdown": "Maps Sportarr leagues to series, seasons to seasons, and events to episodes so sports libraries behave like familiar TV libraries in Silo. The provider is installed disabled by default so administrators can opt in where it fits their library layout.",
     "setup_markdown": "Install the plugin, configure the Sportarr base URL if you do not use `https://sportarr.net`, then enable **Sportarr Metadata** in the metadata provider chain for the relevant sports library.",
     "homepage_url": "https://sportarr.net",
-    "source_url": "https://github.com/Silo-Server/silo-plugin-sportarr",
+    "source_url": "https://github.com/Silo-Server/silo-plugins-metadata-sportarr",
     "support_url": "https://github.com/Silo-Server/silo-server/issues",
-    "changelog_url": "https://github.com/Silo-Server/silo-plugin-sportarr/releases",
+    "changelog_url": "https://github.com/Silo-Server/silo-plugins-metadata-sportarr/releases",
     "publisher_name": "Silo",
     "publisher_url": "https://github.com/Silo-Server",
     "license_spdx": "AGPL-3.0-or-later"
