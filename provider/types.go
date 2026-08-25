@@ -7,6 +7,7 @@ type AgentSearchResponse struct {
 
 type AgentSearchResult struct {
 	ID        string `json:"id"`
+	HubID     string `json:"hub_id"`
 	Title     string `json:"title"`
 	Year      int    `json:"year"`
 	PosterURL string `json:"poster_url"`
@@ -14,13 +15,18 @@ type AgentSearchResult struct {
 
 // AgentSeriesResponse is returned by GET /api/metadata/agents/series/{league_id}.
 type AgentSeriesResponse struct {
+	ID            string   `json:"id"`
+	HubID         string   `json:"hub_id"`
 	Title         string   `json:"title"`
+	SortTitle     string   `json:"sort_title"`
 	Summary       string   `json:"summary"`
 	ContentRating string   `json:"content_rating"`
 	Year          int      `json:"year"`
 	Genres        []string `json:"genres"`
 	Studio        string   `json:"studio"`
 	PosterURL     string   `json:"poster_url"`
+	BannerURL     string   `json:"banner_url"`
+	FanartURL     string   `json:"fanart_url"`
 }
 
 // AgentSeasonsResponse is returned by GET /api/metadata/agents/series/{league_id}/seasons.
@@ -29,10 +35,14 @@ type AgentSeasonsResponse struct {
 }
 
 type AgentSeason struct {
-	CompetitionSeasonID string `json:"competition_season_id"`
-	SeasonNumber        int    `json:"season_number"`
-	Name                string `json:"name"`
-	EpisodeCount        int    `json:"episode_count"`
+	ID           string `json:"id"`
+	HubID        string `json:"hub_id"`
+	SeasonNumber int    `json:"season_number"`
+	Title        string `json:"title"`
+	Summary      string `json:"summary"`
+	PosterURL    string `json:"poster_url"`
+	EpisodeCount int    `json:"episode_count"`
+	Year         int    `json:"year"`
 }
 
 // AgentEpisodesResponse is returned by
@@ -43,6 +53,7 @@ type AgentEpisodesResponse struct {
 
 type AgentEpisode struct {
 	ID              string `json:"id"`
+	HubID           string `json:"hub_id"`
 	Title           string `json:"title"`
 	Summary         string `json:"summary"`
 	SeasonNumber    int    `json:"season_number"`

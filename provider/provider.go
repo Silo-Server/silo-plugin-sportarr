@@ -119,11 +119,30 @@ func (p *Provider) searchByID(ctx context.Context, leagueID string) ([]metadata.
 	return []metadata.SearchResult{{
 		Name:        series.Title,
 		Year:        series.Year,
-		ProviderIDs: map[string]string{"sportarr": leagueID},
+		ProviderIDs: map[string]string{"sportarr": stableID(series.ID, leagueID)},
 		ImageURL:    series.PosterURL,
 		Overview:    series.Summary,
 		Provider:    p.Slug(),
 	}}, nil
+}
+
+// stableID prefers Sportarr's public short ID, which is the durable identifier
+// accepted by the metadata-agent API. The fallback preserves existing records
+// when an older response omits the explicit ID field.
+func stableID(id, fallback string) string {
+	if id != "" {
+		return id
+	}
+	return fallback
+}
+
+// entityID prefers hub_id for child records because their only downstream
+// identifier-based operation is the UUID-oriented entity-image lookup.
+func entityID(hubID, fallback string) string {
+	if hubID != "" {
+		return hubID
+	}
+	return fallback
 }
 
 func (p *Provider) searchByTitle(ctx context.Context, query metadata.SearchQuery) ([]metadata.SearchResult, error) {
@@ -137,7 +156,7 @@ func (p *Provider) searchByTitle(ctx context.Context, query metadata.SearchQuery
 		out = append(out, metadata.SearchResult{
 			Name:        r.Title,
 			Year:        r.Year,
-			ProviderIDs: map[string]string{"sportarr": r.ID},
+			ProviderIDs: map[string]string{"sportarr": stableID(r.ID, r.HubID)},
 			ImageURL:    r.PosterURL,
 			Provider:    p.Slug(),
 		})
@@ -156,13 +175,16 @@ func (p *Provider) GetMetadata(ctx context.Context, req metadata.MetadataRequest
 		return nil, err
 	}
 
+	leagueID := stableID(series.ID, sportarrID)
+
 	result := &metadata.MetadataResult{
 		HasMetadata:   true,
 		Title:         series.Title,
+		SortTitle:     series.SortTitle,
 		Overview:      series.Summary,
 		Year:          series.Year,
 		ContentRating: series.ContentRating,
-		ProviderIDs:   map[string]string{"sportarr": sportarrID},
+		ProviderIDs:   map[string]string{"sportarr": leagueID},
 	}
 
 	result.Genres = append(result.Genres, series.Genres...)
@@ -170,16 +192,29 @@ func (p *Provider) GetMetadata(ctx context.Context, req metadata.MetadataRequest
 		result.Studios = []string{series.Studio}
 	}
 
-	seasons, err := p.client.GetSeasons(ctx, sportarrID)
+	seasons, err := p.client.GetSeasons(ctx, leagueID)
 	if err == nil && seasons != nil {
 		result.SeasonCount = len(seasons.Seasons)
 	}
 
-	imgs, err := p.client.GetEntityImages(ctx, "league", sportarrID)
-	if err == nil {
-		result.PosterPath = pickPrimaryURL(imgs.Images, "poster")
-		result.BackdropPath = pickPrimaryURL(imgs.Images, "backdrop")
-		result.LogoPath = pickPrimaryURL(imgs.Images, "logo")
+	// hub_id is an implementation identifier used only by the entity-image API.
+	// Keep the stable short ID for metadata-agent calls and persisted provider IDs.
+	if series.HubID != "" {
+		imgs, err := p.client.GetEntityImages(ctx, "league", series.HubID)
+		if err == nil {
+			result.PosterPath = pickPrimaryURL(imgs.Images, "poster")
+			result.BackdropPath = pickPrimaryURL(imgs.Images, "backdrop")
+			result.LogoPath = pickPrimaryURL(imgs.Images, "logo")
+		}
+	}
+
+	// Fall back to the absolute URLs the agent series endpoint provides when the
+	// entity-image catalog has no completed image of that kind.
+	if result.PosterPath == "" {
+		result.PosterPath = series.PosterURL
+	}
+	if result.BackdropPath == "" {
+		result.BackdropPath = series.FanartURL
 	}
 
 	return result, nil
@@ -198,22 +233,29 @@ func (p *Provider) GetSeasons(ctx context.Context, req metadata.SeasonsRequest) 
 
 	var seasonIDs []string
 	for _, s := range resp.Seasons {
-		if s.CompetitionSeasonID != "" {
-			seasonIDs = append(seasonIDs, s.CompetitionSeasonID)
+		if s.HubID != "" {
+			seasonIDs = append(seasonIDs, s.HubID)
 		}
 	}
 	imagesByID := p.client.GetEntityImagesBatch(ctx, "season", seasonIDs)
 
 	seasons := make([]metadata.SeasonResult, 0, len(resp.Seasons))
 	for _, s := range resp.Seasons {
+		seasonID := entityID(s.HubID, s.ID)
+		if seasonID == "" {
+			seasonID = fmt.Sprintf("%s:%d", sportarrID, s.SeasonNumber)
+		}
 		posterPath := ""
-		if imgs, ok := imagesByID[s.CompetitionSeasonID]; ok {
+		if imgs, ok := imagesByID[s.HubID]; ok {
 			posterPath = pickPrimaryURL(imgs.Images, "poster")
 		}
+		if posterPath == "" {
+			posterPath = s.PosterURL
+		}
 		seasons = append(seasons, metadata.SeasonResult{
-			ContentID:    fmt.Sprintf("%s:%d", sportarrID, s.SeasonNumber),
+			ContentID:    seasonID,
 			SeasonNumber: s.SeasonNumber,
-			Title:        s.Name,
+			Title:        s.Title,
 			PosterPath:   posterPath,
 		})
 	}
@@ -233,9 +275,10 @@ func (p *Provider) GetEpisodes(ctx context.Context, req metadata.EpisodesRequest
 
 	episodes := make([]metadata.EpisodeResult, 0, len(resp.Episodes))
 	for _, ep := range resp.Episodes {
-		providerIDs := map[string]string{"sportarr": ep.ID}
+		eventID := entityID(ep.HubID, ep.ID)
+		providerIDs := map[string]string{"sportarr": eventID}
 		episodes = append(episodes, metadata.EpisodeResult{
-			ContentID:     ep.ID,
+			ContentID:     eventID,
 			ProviderIDs:   providerIDs,
 			SeasonNumber:  ep.SeasonNumber,
 			EpisodeNumber: ep.EpisodeNumber,
@@ -259,6 +302,14 @@ func (p *Provider) GetImages(ctx context.Context, req metadata.ImageRequest) ([]
 	switch req.ContentType {
 	case "series":
 		entityType = "league"
+		series, err := p.client.GetSeries(ctx, sportarrID)
+		if err != nil {
+			return nil, err
+		}
+		if series.HubID == "" {
+			return nil, nil
+		}
+		sportarrID = series.HubID
 	case "season":
 		entityType = "season"
 	case "episode":
@@ -273,4 +324,3 @@ func (p *Provider) GetImages(ctx context.Context, req metadata.ImageRequest) ([]
 	}
 	return entityImagesToRemote(resp.Images), nil
 }
-
