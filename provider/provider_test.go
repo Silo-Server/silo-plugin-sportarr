@@ -23,8 +23,8 @@ func TestSearchByTitle(t *testing.T) {
 	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(AgentSearchResponse{
 			Results: []AgentSearchResult{
-				{ID: "league-1", Title: "Premier League", Year: 1992},
-				{ID: "league-2", Title: "Premier League 2", Year: 2023},
+				{ID: "league-1", HubID: "league-uuid-1", Title: "Premier League", Year: 1992},
+				{ID: "league-2", HubID: "league-uuid-2", Title: "Premier League 2", Year: 2023},
 			},
 		})
 	}))
@@ -63,16 +63,15 @@ func TestSearchByProviderID(t *testing.T) {
 	if results[0].Name != "UFC" {
 		t.Errorf("expected name UFC, got %s", results[0].Name)
 	}
-	// Canonical provider ID must be the UUID hub_id (the only ID the image API accepts).
-	if results[0].ProviderIDs["sportarr"] != "league-uuid-1" {
-		t.Errorf("expected canonical hub_id, got %q", results[0].ProviderIDs["sportarr"])
+	if results[0].ProviderIDs["sportarr"] != "lg-000001" {
+		t.Errorf("expected stable short ID, got %q", results[0].ProviderIDs["sportarr"])
 	}
 }
 
 func TestGetMetadata(t *testing.T) {
 	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/metadata/agents/series/league-uuid-1":
+		case "/api/metadata/agents/series/lg-000001":
 			json.NewEncoder(w).Encode(AgentSeriesResponse{
 				ID:        "lg-000001",
 				HubID:     "league-uuid-1",
@@ -83,7 +82,7 @@ func TestGetMetadata(t *testing.T) {
 				Studio:    "FIA",
 				FanartURL: "https://sportarr.net/static/images/league/fanart.jpg",
 			})
-		case "/api/metadata/agents/series/league-uuid-1/seasons":
+		case "/api/metadata/agents/series/lg-000001/seasons":
 			json.NewEncoder(w).Encode(AgentSeasonsResponse{
 				Seasons: []AgentSeason{
 					{HubID: "s-2023", SeasonNumber: 2023, Title: "2023"},
@@ -103,7 +102,7 @@ func TestGetMetadata(t *testing.T) {
 	}))
 
 	result, err := p.GetMetadata(context.Background(), metadata.MetadataRequest{
-		ProviderIDs: map[string]string{"sportarr": "league-uuid-1"},
+		ProviderIDs: map[string]string{"sportarr": "lg-000001"},
 		ContentType: "series",
 	})
 	if err != nil {
@@ -131,15 +130,83 @@ func TestGetMetadata(t *testing.T) {
 	if result.LogoPath != "/static/images/league/l1.png" {
 		t.Errorf("expected logo path from entity images, got %q", result.LogoPath)
 	}
-	if result.ProviderIDs["sportarr"] != "league-uuid-1" {
-		t.Errorf("expected canonical hub_id, got %q", result.ProviderIDs["sportarr"])
+	if result.ProviderIDs["sportarr"] != "lg-000001" {
+		t.Errorf("expected stable short ID, got %q", result.ProviderIDs["sportarr"])
+	}
+}
+
+func TestGetMetadataFallsBackWhenEntityImagesUnauthorized(t *testing.T) {
+	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/metadata/agents/series/lg-000001":
+			json.NewEncoder(w).Encode(AgentSeriesResponse{
+				ID:        "lg-000001",
+				HubID:     "league-uuid-1",
+				Title:     "Formula 1",
+				PosterURL: "/api/images/league/lg-000001/poster",
+				FanartURL: "/api/images/league/lg-000001/fanart",
+			})
+		case "/api/metadata/agents/series/lg-000001/seasons":
+			json.NewEncoder(w).Encode(AgentSeasonsResponse{})
+		case "/api/v1/images/entity/league/league-uuid-1":
+			http.Error(w, "API key required", http.StatusUnauthorized)
+		default:
+			t.Errorf("unexpected request to %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+
+	result, err := p.GetMetadata(context.Background(), metadata.MetadataRequest{
+		ProviderIDs: map[string]string{"sportarr": "lg-000001"},
+		ContentType: "series",
+	})
+	if err != nil {
+		t.Fatalf("get metadata failed: %v", err)
+	}
+	if result.ProviderIDs["sportarr"] != "lg-000001" {
+		t.Errorf("expected stable short ID, got %q", result.ProviderIDs["sportarr"])
+	}
+	if result.PosterPath != "/api/images/league/lg-000001/poster" {
+		t.Errorf("expected agent poster fallback, got %q", result.PosterPath)
+	}
+	if result.BackdropPath != "/api/images/league/lg-000001/fanart" {
+		t.Errorf("expected agent fanart fallback, got %q", result.BackdropPath)
+	}
+}
+
+func TestGetMetadataWithoutHubIDSkipsEntityImageAPI(t *testing.T) {
+	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/metadata/agents/series/lg-000001":
+			json.NewEncoder(w).Encode(AgentSeriesResponse{
+				ID:        "lg-000001",
+				Title:     "Formula 1",
+				PosterURL: "/api/images/league/lg-000001/poster",
+			})
+		case "/api/metadata/agents/series/lg-000001/seasons":
+			json.NewEncoder(w).Encode(AgentSeasonsResponse{})
+		default:
+			t.Errorf("unexpected request to %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+
+	result, err := p.GetMetadata(context.Background(), metadata.MetadataRequest{
+		ProviderIDs: map[string]string{"sportarr": "lg-000001"},
+		ContentType: "series",
+	})
+	if err != nil {
+		t.Fatalf("get metadata failed: %v", err)
+	}
+	if result.PosterPath != "/api/images/league/lg-000001/poster" {
+		t.Errorf("expected agent poster without an entity-image request, got %q", result.PosterPath)
 	}
 }
 
 func TestGetSeasons(t *testing.T) {
 	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/metadata/agents/series/league-uuid-1/seasons":
+		case "/api/metadata/agents/series/lg-000001/seasons":
 			json.NewEncoder(w).Encode(AgentSeasonsResponse{
 				Seasons: []AgentSeason{
 					{HubID: "cs-2023-uuid", SeasonNumber: 2023, Title: "2023 Season", EpisodeCount: 23},
@@ -159,7 +226,7 @@ func TestGetSeasons(t *testing.T) {
 	}))
 
 	seasons, err := p.GetSeasons(context.Background(), metadata.SeasonsRequest{
-		ProviderIDs: map[string]string{"sportarr": "league-uuid-1"},
+		ProviderIDs: map[string]string{"sportarr": "lg-000001"},
 	})
 	if err != nil {
 		t.Fatalf("get seasons failed: %v", err)
@@ -190,10 +257,11 @@ func TestGetSeasons(t *testing.T) {
 func TestGetSeasonsWithoutHubID(t *testing.T) {
 	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/api/metadata/agents/series/league-uuid-1/seasons":
+		case "/api/metadata/agents/series/lg-000001/seasons":
 			json.NewEncoder(w).Encode(AgentSeasonsResponse{
 				Seasons: []AgentSeason{
-					{SeasonNumber: 2023, Title: "2023 Season"},
+					{ID: "cs-2023", SeasonNumber: 2023, Title: "2023 Season"},
+					{SeasonNumber: 2024, Title: "2024 Season"},
 				},
 			})
 		default:
@@ -203,13 +271,13 @@ func TestGetSeasonsWithoutHubID(t *testing.T) {
 	}))
 
 	seasons, err := p.GetSeasons(context.Background(), metadata.SeasonsRequest{
-		ProviderIDs: map[string]string{"sportarr": "league-uuid-1"},
+		ProviderIDs: map[string]string{"sportarr": "lg-000001"},
 	})
 	if err != nil {
 		t.Fatalf("get seasons failed: %v", err)
 	}
-	if len(seasons) != 1 {
-		t.Fatalf("expected 1 season, got %d", len(seasons))
+	if len(seasons) != 2 {
+		t.Fatalf("expected 2 seasons, got %d", len(seasons))
 	}
 	if seasons[0].Title != "2023 Season" {
 		t.Errorf("expected title 2023 Season, got %q", seasons[0].Title)
@@ -217,10 +285,19 @@ func TestGetSeasonsWithoutHubID(t *testing.T) {
 	if seasons[0].PosterPath != "" {
 		t.Errorf("expected empty poster path when no hub_id and no poster_url, got %q", seasons[0].PosterPath)
 	}
+	if seasons[0].ContentID != "cs-2023" {
+		t.Errorf("expected short ID fallback when hub_id is absent, got %q", seasons[0].ContentID)
+	}
+	if seasons[1].ContentID != "lg-000001:2024" {
+		t.Errorf("expected deterministic fallback when all season IDs are absent, got %q", seasons[1].ContentID)
+	}
 }
 
 func TestGetEpisodes(t *testing.T) {
 	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/metadata/agents/series/lg-000001/season/2024/episodes" {
+			t.Errorf("expected short series ID in agent request, got %s", r.URL.Path)
+		}
 		json.NewEncoder(w).Encode(AgentEpisodesResponse{
 			Episodes: []AgentEpisode{
 				{ID: "ev-1", HubID: "ev-uuid-1", Title: "Monaco GP", SeasonNumber: 2024, EpisodeNumber: 8, AirDate: "2024-05-26", DurationMinutes: 120,
@@ -231,7 +308,7 @@ func TestGetEpisodes(t *testing.T) {
 	}))
 
 	episodes, err := p.GetEpisodes(context.Background(), metadata.EpisodesRequest{
-		ProviderIDs:  map[string]string{"sportarr": "league-uuid-1"},
+		ProviderIDs:  map[string]string{"sportarr": "lg-000001"},
 		SeasonNumber: 2024,
 	})
 	if err != nil {
@@ -254,8 +331,12 @@ func TestGetEpisodes(t *testing.T) {
 
 func TestGetImagesForSeries(t *testing.T) {
 	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/images/entity/league/league-1" {
-			t.Errorf("expected entity image path, got %s", r.URL.Path)
+		if r.URL.Path == "/api/metadata/agents/series/lg-000001" {
+			json.NewEncoder(w).Encode(AgentSeriesResponse{ID: "lg-000001", HubID: "league-uuid-1"})
+			return
+		}
+		if r.URL.Path != "/api/v1/images/entity/league/league-uuid-1" {
+			t.Errorf("expected entity image path with hub UUID, got %s", r.URL.Path)
 		}
 		w1, h1 := 680, 1000
 		w2, h2 := 1920, 1080
@@ -270,7 +351,7 @@ func TestGetImagesForSeries(t *testing.T) {
 	}))
 
 	images, err := p.GetImages(context.Background(), metadata.ImageRequest{
-		ProviderIDs: map[string]string{"sportarr": "league-1"},
+		ProviderIDs: map[string]string{"sportarr": "lg-000001"},
 		ContentType: "series",
 	})
 	if err != nil {

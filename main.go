@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -27,13 +28,18 @@ func sportarrCanonicalPath(baseURL, imageURL string) string {
 	if imageURL == "" {
 		return ""
 	}
-	if strings.HasPrefix(imageURL, baseURL) {
-		return "sportarr://" + strings.TrimPrefix(imageURL, baseURL)
+
+	base, baseErr := url.Parse(baseURL)
+	image, imageErr := url.Parse(imageURL)
+	if baseErr == nil && imageErr == nil && base.IsAbs() && image.IsAbs() &&
+		strings.EqualFold(base.Scheme, image.Scheme) && strings.EqualFold(base.Host, image.Host) {
+		return "sportarr://" + image.RequestURI()
 	}
+
 	// The Sportarr image API returns root-relative paths (e.g. /static/images/…);
-	// canonicalize them too so ResolveImageURL can rebuild a fetchable URL.
-	if strings.HasPrefix(imageURL, "/") {
-		return "sportarr://" + imageURL
+	// retain their origin-relative meaning in the canonical form.
+	if imageErr == nil && image.Host == "" && strings.HasPrefix(imageURL, "/") {
+		return "sportarr://" + image.RequestURI()
 	}
 	return imageURL
 }
@@ -43,7 +49,11 @@ func resolveOneSportarrPath(baseURL, path, _ string) string {
 		return ""
 	}
 	if strings.HasPrefix(path, "sportarr://") {
-		return baseURL + strings.TrimPrefix(path, "sportarr://")
+		base, baseErr := url.Parse(baseURL)
+		reference, referenceErr := url.Parse(strings.TrimPrefix(path, "sportarr://"))
+		if baseErr == nil && referenceErr == nil && base.IsAbs() && !reference.IsAbs() && reference.Host == "" {
+			return base.ResolveReference(reference).String()
+		}
 	}
 	return path
 }
