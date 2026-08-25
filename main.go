@@ -6,9 +6,11 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -34,7 +36,11 @@ func sportarrCanonicalPath(baseURL, imageURL string) string {
 		return imageURL
 	}
 	if strings.HasPrefix(imageURL, "/") && !strings.HasPrefix(imageURL, "//") {
-		return "sportarr://" + imageURL
+		image, err := url.Parse(imageURL)
+		if err != nil || image.Host != "" || image.User != nil {
+			return imageURL
+		}
+		return canonicalSportarrReference(base, image)
 	}
 	image, err := url.Parse(imageURL)
 	if err != nil || image.Scheme == "" || image.Host == "" || image.User != nil {
@@ -49,9 +55,14 @@ func sportarrCanonicalPath(baseURL, imageURL string) string {
 		return imageURL
 	}
 
+	return canonicalSportarrReference(base, image)
+}
+
+func canonicalSportarrReference(base, image *url.URL) string {
 	canonicalPath := image.EscapedPath()
 	baseEscapedPath := strings.TrimRight(base.EscapedPath(), "/")
-	if baseEscapedPath != "" && strings.HasPrefix(canonicalPath, baseEscapedPath) {
+	if baseEscapedPath != "" &&
+		(canonicalPath == baseEscapedPath || strings.HasPrefix(canonicalPath, baseEscapedPath+"/")) {
 		canonicalPath = strings.TrimPrefix(canonicalPath, baseEscapedPath)
 	}
 	if image.ForceQuery || image.RawQuery != "" {
@@ -330,10 +341,39 @@ func (s *metadataServer) ResolveImageURL(ctx context.Context, req *pluginv1.Reso
 }
 
 func (s *metadataServer) ResolveImageURLs(ctx context.Context, req *pluginv1.ResolveImageURLsRequest) (*pluginv1.ResolveImageURLsResponse, error) {
-	urls := make(map[string]string, len(req.GetPaths()))
-	for _, path := range req.GetPaths() {
-		urls[path] = s.resolveImageURL(ctx, path, req.GetVariant())
+	paths := req.GetPaths()
+	urls := make(map[string]string, len(paths))
+	for _, path := range paths {
+		urls[path] = ""
 	}
+
+	workerCount := min(8, len(paths))
+	jobs := make(chan string)
+	var workers sync.WaitGroup
+	var urlsMu sync.Mutex
+	for range workerCount {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for path := range jobs {
+				resolved := s.resolveImageURL(ctx, path, req.GetVariant())
+				urlsMu.Lock()
+				urls[path] = resolved
+				urlsMu.Unlock()
+			}
+		}()
+	}
+
+sendPaths:
+	for _, path := range paths {
+		select {
+		case jobs <- path:
+		case <-ctx.Done():
+			break sendPaths
+		}
+	}
+	close(jobs)
+	workers.Wait()
 	return &pluginv1.ResolveImageURLsResponse{Urls: urls}, nil
 }
 
@@ -343,10 +383,12 @@ func (s *metadataServer) resolveImageURL(ctx context.Context, path, variant stri
 	}
 	p, err := s.runtime.providerForRequest()
 	if err != nil {
+		slog.Warn("sportarr: image resolution skipped", "path", path, "error", err)
 		return ""
 	}
 	resolved, err := p.ResolveImageRedirect(ctx, path)
 	if err != nil {
+		slog.Warn("sportarr: image redirect resolution failed", "path", path, "error", err)
 		return ""
 	}
 	return resolved

@@ -287,6 +287,13 @@ func (c *Client) ResolveImageRedirect(ctx context.Context, path string) (string,
 	if !strings.HasPrefix(path, "/api/") {
 		return "", fmt.Errorf("sportarr: image redirect path must start with /api/")
 	}
+	requestPath, err := url.Parse(path)
+	if err != nil {
+		return "", fmt.Errorf("sportarr: invalid image redirect path")
+	}
+	fragment := requestPath.Fragment
+	requestPath.Fragment = ""
+	path = requestPath.String()
 	if err := c.limiter.Wait(ctx); err != nil {
 		return "", err
 	}
@@ -324,6 +331,9 @@ func (c *Client) ResolveImageRedirect(ctx context.Context, path string) (string,
 		if err != nil || portNumber < 1 || portNumber > 65535 {
 			return "", fmt.Errorf("sportarr: image redirect location has invalid port")
 		}
+	}
+	if target.Fragment == "" {
+		target.Fragment = fragment
 	}
 
 	host := target.Hostname()

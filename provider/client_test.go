@@ -394,6 +394,31 @@ func TestResolveImageRedirectAuthenticatesAndPreservesBasePath(t *testing.T) {
 	}
 }
 
+func TestResolveImageRedirectPreservesRequestFragment(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Fragment != "" || strings.Contains(r.RequestURI, "#") {
+			t.Errorf("redirect request included fragment: %q", r.RequestURI)
+		}
+		w.Header().Set("Location", "https://cdn.example/formula-1.svg")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	c := NewClient(100)
+	c.SetBaseURL(srv.URL)
+	c.lookupIP = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("8.8.8.8")}, nil
+	}
+
+	got, err := c.ResolveImageRedirect(context.Background(), "/api/v1/images/image-1#logo-layer")
+	if err != nil {
+		t.Fatalf("resolve image redirect with fragment: %v", err)
+	}
+	if want := "https://cdn.example/formula-1.svg#logo-layer"; got != want {
+		t.Fatalf("redirect target = %q, want %q", got, want)
+	}
+}
+
 func TestResolveImageRedirectRejectsPrivateTarget(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", "https://127.0.0.1/formula-1.jpg")

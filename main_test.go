@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	publicmanifest "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/manifest"
@@ -186,6 +187,13 @@ func TestCanonicalRoundTrip(t *testing.T) {
 			resolved:  "https://media.example/sportarr/static/images/league/9a/badge.png",
 		},
 		{
+			name:      "root-relative URL already includes subpath base",
+			baseURL:   "https://media.example/sportarr",
+			imageURL:  "/sportarr/static/images/league/9a/badge.png",
+			canonical: "sportarr:///static/images/league/9a/badge.png",
+			resolved:  "https://media.example/sportarr/static/images/league/9a/badge.png",
+		},
+		{
 			name:      "absolute URL under subpath base",
 			baseURL:   "https://media.example/sportarr",
 			imageURL:  "https://media.example/sportarr/static/images/league/9a/badge.png",
@@ -279,6 +287,73 @@ func TestConfiguredImageRPCAuthenticatesAndPreservesBasePath(t *testing.T) {
 	}
 	if got, want := response.GetUrl(), "https://8.8.8.8/formula-1.jpg"; got != want {
 		t.Fatalf("resolved configured URL = %q, want %q", got, want)
+	}
+}
+
+func TestConfiguredImageBatchResolvesConcurrently(t *testing.T) {
+	arrivals := make(chan struct{}, 2)
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrivals <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Location", "https://8.8.8.8"+r.URL.Path+".jpg")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	configured, err := structpb.NewStruct(map[string]any{
+		"base_url": srv.URL,
+		"api_key":  "sportarr-secret",
+	})
+	if err != nil {
+		t.Fatalf("make Sportarr config: %v", err)
+	}
+	runtime := &runtimeServer{}
+	if _, err := runtime.Configure(context.Background(), &pluginv1.ConfigureRequest{Config: []*pluginv1.ConfigEntry{{Key: "sportarr", Value: configured}}}); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	server := &metadataServer{runtime: runtime}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan *pluginv1.ResolveImageURLsResponse, 1)
+	go func() {
+		response, _ := server.ResolveImageURLs(ctx, &pluginv1.ResolveImageURLsRequest{
+			Paths: []string{"/api/v1/images/image-1", "/api/v1/images/image-2"},
+		})
+		done <- response
+	}()
+
+	for range 2 {
+		select {
+		case <-arrivals:
+		case <-ctx.Done():
+			t.Fatal("batch image redirects were not in flight concurrently")
+		}
+	}
+	close(release)
+
+	select {
+	case response := <-done:
+		for _, path := range []string{"/api/v1/images/image-1", "/api/v1/images/image-2"} {
+			if response.GetUrls()[path] == "" {
+				t.Fatalf("batch response omitted resolved URL for %q", path)
+			}
+		}
+	case <-ctx.Done():
+		t.Fatal("batch image redirect resolution did not complete")
 	}
 }
 
