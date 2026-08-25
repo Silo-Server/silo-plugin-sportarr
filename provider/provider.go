@@ -13,10 +13,15 @@ type Provider struct {
 }
 
 func NewProvider(baseURL string) *Provider {
+	return NewProviderWithAPIKey(baseURL, "")
+}
+
+func NewProviderWithAPIKey(baseURL, apiKey string) *Provider {
 	c := NewClient(10)
 	if baseURL != "" {
 		c.SetBaseURL(baseURL)
 	}
+	c.SetAPIKey(apiKey)
 	return &Provider{client: c}
 }
 
@@ -27,6 +32,10 @@ func NewProviderWithClient(c *Client) *Provider {
 func (p *Provider) Slug() string       { return "sportarr" }
 func (p *Provider) Name() string       { return "Sportarr" }
 func (p *Provider) ForTypes() []string { return []string{"series"} }
+
+func (p *Provider) ResolveImageRedirect(ctx context.Context, path string) (string, error) {
+	return p.client.ResolveImageRedirect(ctx, path)
+}
 
 func mapImageType(t string) (metadata.ImageType, bool) {
 	switch t {
@@ -199,7 +208,7 @@ func (p *Provider) GetMetadata(ctx context.Context, req metadata.MetadataRequest
 
 	// hub_id is an implementation identifier used only by the entity-image API.
 	// Keep the stable short ID for metadata-agent calls and persisted provider IDs.
-	if series.HubID != "" {
+	if series.HubID != "" && p.client.hasAPIKey() {
 		imgs, err := p.client.GetEntityImages(ctx, "league", series.HubID)
 		if err == nil {
 			result.PosterPath = pickPrimaryURL(imgs.Images, "poster")
@@ -231,13 +240,16 @@ func (p *Provider) GetSeasons(ctx context.Context, req metadata.SeasonsRequest) 
 		return nil, err
 	}
 
-	var seasonIDs []string
-	for _, s := range resp.Seasons {
-		if s.HubID != "" {
-			seasonIDs = append(seasonIDs, s.HubID)
+	imagesByID := make(map[string]*EntityImageResponse)
+	if p.client.hasAPIKey() {
+		var seasonIDs []string
+		for _, s := range resp.Seasons {
+			if s.HubID != "" {
+				seasonIDs = append(seasonIDs, s.HubID)
+			}
 		}
+		imagesByID = p.client.GetEntityImagesBatch(ctx, "season", seasonIDs)
 	}
-	imagesByID := p.client.GetEntityImagesBatch(ctx, "season", seasonIDs)
 
 	seasons := make([]metadata.SeasonResult, 0, len(resp.Seasons))
 	for _, s := range resp.Seasons {
@@ -299,16 +311,18 @@ func (p *Provider) GetImages(ctx context.Context, req metadata.ImageRequest) ([]
 	}
 
 	var entityType string
+	var series *AgentSeriesResponse
 	switch req.ContentType {
 	case "series":
-		entityType = "league"
-		series, err := p.client.GetSeries(ctx, sportarrID)
+		var err error
+		series, err = p.client.GetSeries(ctx, sportarrID)
 		if err != nil {
 			return nil, err
 		}
-		if series.HubID == "" {
-			return nil, nil
+		if !p.client.hasAPIKey() || series.HubID == "" {
+			return publicSeriesImages(series), nil
 		}
+		entityType = "league"
 		sportarrID = series.HubID
 	case "season":
 		entityType = "season"
@@ -317,10 +331,30 @@ func (p *Provider) GetImages(ctx context.Context, req metadata.ImageRequest) ([]
 	default:
 		return nil, nil
 	}
+	if !p.client.hasAPIKey() {
+		return nil, nil
+	}
 
 	resp, err := p.client.GetEntityImages(ctx, entityType, sportarrID)
 	if err != nil {
+		if series != nil {
+			return publicSeriesImages(series), nil
+		}
 		return nil, err
 	}
 	return entityImagesToRemote(resp.Images), nil
+}
+
+func publicSeriesImages(series *AgentSeriesResponse) []metadata.RemoteImage {
+	images := make([]metadata.RemoteImage, 0, 3)
+	if series.PosterURL != "" {
+		images = append(images, metadata.RemoteImage{URL: series.PosterURL, Type: metadata.ImagePoster})
+	}
+	if series.FanartURL != "" {
+		images = append(images, metadata.RemoteImage{URL: series.FanartURL, Type: metadata.ImageBackdrop})
+	}
+	if series.BannerURL != "" {
+		images = append(images, metadata.RemoteImage{URL: series.BannerURL, Type: metadata.ImageBanner})
+	}
+	return images
 }

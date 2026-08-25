@@ -7,7 +7,7 @@
     "display_name": "Sportarr Metadata",
     "summary": "Build sports libraries from Sportarr league, season, and event metadata.",
     "description_markdown": "Maps Sportarr leagues to series, seasons to seasons, and events to episodes so sports libraries behave like familiar TV libraries in Silo. The provider is installed disabled by default so administrators can opt in where it fits their library layout.",
-    "setup_markdown": "Install the plugin, configure the Sportarr base URL if you do not use `https://sportarr.net`, then enable **Sportarr Metadata** in the metadata provider chain for the relevant sports library.",
+    "setup_markdown": "Install the plugin, configure the Sportarr base URL if you do not use `https://sportarr.net`, and add the instance API key when its protected image API is enabled. Then enable **Sportarr Metadata** in the metadata provider chain for the relevant sports library.",
     "homepage_url": "https://sportarr.net",
     "source_url": "https://github.com/Silo-Server/silo-plugin-metadata-sportarr",
     "support_url": "https://github.com/Silo-Server/silo-server/issues",
@@ -52,7 +52,7 @@
       "title": "Sportarr",
       "description": "Configure Sportarr API access",
       "required": false,
-      "json_schema": "{\"type\":\"object\",\"properties\":{\"base_url\":{\"type\":\"string\"}}}",
+      "json_schema": "{\"type\":\"object\",\"properties\":{\"base_url\":{\"type\":\"string\"},\"api_key\":{\"type\":\"string\"}},\"additionalProperties\":false}",
       "admin_form": {
         "fields": [
           {
@@ -61,6 +61,13 @@
             "description": "Sportarr instance URL. Defaults to https://sportarr.net if left empty.",
             "control": 1,
             "placeholder": "https://sportarr.net"
+          },
+          {
+            "key": "api_key",
+            "label": "API Key",
+            "description": "API key for protected image endpoints on a self-hosted Sportarr instance.",
+            "control": "ADMIN_FORM_CONTROL_PASSWORD",
+            "secret": true
           }
         ]
       }

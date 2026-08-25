@@ -6,9 +6,11 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -29,19 +31,67 @@ func sportarrCanonicalPath(baseURL, imageURL string) string {
 		return ""
 	}
 
-	base, baseErr := url.Parse(baseURL)
-	image, imageErr := url.Parse(imageURL)
-	if baseErr == nil && imageErr == nil && base.IsAbs() && image.IsAbs() &&
-		strings.EqualFold(base.Scheme, image.Scheme) && strings.EqualFold(base.Host, image.Host) {
-		return "sportarr://" + image.RequestURI()
+	base, err := url.Parse(baseURL)
+	if err != nil || base.Scheme == "" || base.Host == "" || base.User != nil {
+		return imageURL
+	}
+	if strings.HasPrefix(imageURL, "/") && !strings.HasPrefix(imageURL, "//") {
+		image, err := url.Parse(imageURL)
+		if err != nil || image.Host != "" || image.User != nil {
+			return imageURL
+		}
+		return canonicalSportarrReference(base, image)
+	}
+	image, err := url.Parse(imageURL)
+	if err != nil || image.Scheme == "" || image.Host == "" || image.User != nil {
+		return imageURL
+	}
+	if !sameSportarrOrigin(base, image) {
+		return imageURL
 	}
 
-	// The Sportarr image API returns root-relative paths (e.g. /static/images/…);
-	// retain their origin-relative meaning in the canonical form.
-	if imageErr == nil && image.Host == "" && strings.HasPrefix(imageURL, "/") {
-		return "sportarr://" + image.RequestURI()
+	basePath := strings.TrimRight(base.Path, "/")
+	if basePath != "" && image.Path != basePath && !strings.HasPrefix(image.Path, basePath+"/") {
+		return imageURL
 	}
-	return imageURL
+
+	return canonicalSportarrReference(base, image)
+}
+
+func canonicalSportarrReference(base, image *url.URL) string {
+	canonicalPath := image.EscapedPath()
+	baseEscapedPath := strings.TrimRight(base.EscapedPath(), "/")
+	if baseEscapedPath != "" &&
+		(canonicalPath == baseEscapedPath || strings.HasPrefix(canonicalPath, baseEscapedPath+"/")) {
+		canonicalPath = strings.TrimPrefix(canonicalPath, baseEscapedPath)
+	}
+	if image.ForceQuery || image.RawQuery != "" {
+		canonicalPath += "?" + image.RawQuery
+	}
+	if image.Fragment != "" {
+		canonicalPath += "#" + image.Fragment
+	}
+	return "sportarr://" + canonicalPath
+}
+
+func sameSportarrOrigin(base, image *url.URL) bool {
+	return strings.EqualFold(base.Scheme, image.Scheme) &&
+		strings.EqualFold(base.Hostname(), image.Hostname()) &&
+		effectivePort(base) == effectivePort(image)
+}
+
+func effectivePort(value *url.URL) string {
+	if port := value.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(value.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 func resolveOneSportarrPath(baseURL, path, _ string) string {
@@ -49,11 +99,14 @@ func resolveOneSportarrPath(baseURL, path, _ string) string {
 		return ""
 	}
 	if strings.HasPrefix(path, "sportarr://") {
-		base, baseErr := url.Parse(baseURL)
-		reference, referenceErr := url.Parse(strings.TrimPrefix(path, "sportarr://"))
-		if baseErr == nil && referenceErr == nil && base.IsAbs() && !reference.IsAbs() && reference.Host == "" {
-			return base.ResolveReference(reference).String()
+		reference := strings.TrimPrefix(path, "sportarr://")
+		if strings.HasPrefix(reference, "//") {
+			return path
 		}
+		return baseURL + reference
+	}
+	if strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "//") {
+		return baseURL + path
 	}
 	return path
 }
@@ -61,9 +114,10 @@ func resolveOneSportarrPath(baseURL, path, _ string) string {
 type runtimeServer struct {
 	runtimedefault.Server
 
-	manifest *pluginv1.PluginManifest
-	provider *provider.Provider
-	baseURL  string
+	manifest          *pluginv1.PluginManifest
+	provider          *provider.Provider
+	baseURL           string
+	baseURLConfigured bool
 }
 
 type metadataServer struct {
@@ -80,6 +134,8 @@ func (s *runtimeServer) GetManifest(context.Context, *pluginv1.GetManifestReques
 
 func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequest) (*pluginv1.ConfigureResponse, error) {
 	baseURL := defaultBaseURL
+	baseURLConfigured := false
+	apiKey := ""
 
 	for _, entry := range req.GetConfig() {
 		if entry.GetKey() != "sportarr" {
@@ -87,14 +143,26 @@ func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequ
 		}
 		if val := entry.GetValue(); val != nil {
 			m := val.AsMap()
-			if u, ok := m["base_url"].(string); ok && u != "" {
-				baseURL = strings.TrimRight(u, "/")
+			if u, ok := m["base_url"].(string); ok {
+				if u = strings.TrimSpace(u); u != "" {
+					baseURL = strings.TrimRight(u, "/")
+					baseURLConfigured = true
+				}
+			}
+			if key, ok := m["api_key"].(string); ok {
+				apiKey = strings.TrimSpace(key)
 			}
 		}
 	}
 
 	s.baseURL = baseURL
-	s.provider = provider.NewProvider(baseURL)
+	s.baseURLConfigured = baseURLConfigured
+	if !baseURLConfigured {
+		// The key belongs to a self-hosted Sportarr instance. Never send it to
+		// the default public hub when no instance URL was explicitly selected.
+		apiKey = ""
+	}
+	s.provider = provider.NewProviderWithAPIKey(baseURL, apiKey)
 	return &pluginv1.ConfigureResponse{}, nil
 }
 
@@ -267,17 +335,63 @@ func (s *metadataServer) GetImages(ctx context.Context, req *pluginv1.GetImagesR
 	return response, nil
 }
 
-func (s *metadataServer) ResolveImageURL(_ context.Context, req *pluginv1.ResolveImageURLRequest) (*pluginv1.ResolveImageURLResponse, error) {
-	resolved := resolveOneSportarrPath(s.runtime.baseURL, req.GetPath(), req.GetVariant())
+func (s *metadataServer) ResolveImageURL(ctx context.Context, req *pluginv1.ResolveImageURLRequest) (*pluginv1.ResolveImageURLResponse, error) {
+	resolved := s.resolveImageURL(ctx, req.GetPath(), req.GetVariant())
 	return &pluginv1.ResolveImageURLResponse{Url: resolved}, nil
 }
 
-func (s *metadataServer) ResolveImageURLs(_ context.Context, req *pluginv1.ResolveImageURLsRequest) (*pluginv1.ResolveImageURLsResponse, error) {
-	urls := make(map[string]string, len(req.GetPaths()))
-	for _, path := range req.GetPaths() {
-		urls[path] = resolveOneSportarrPath(s.runtime.baseURL, path, req.GetVariant())
+func (s *metadataServer) ResolveImageURLs(ctx context.Context, req *pluginv1.ResolveImageURLsRequest) (*pluginv1.ResolveImageURLsResponse, error) {
+	paths := req.GetPaths()
+	urls := make(map[string]string, len(paths))
+	for _, path := range paths {
+		urls[path] = ""
 	}
+
+	workerCount := min(8, len(paths))
+	jobs := make(chan string)
+	var workers sync.WaitGroup
+	var urlsMu sync.Mutex
+	for range workerCount {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for path := range jobs {
+				resolved := s.resolveImageURL(ctx, path, req.GetVariant())
+				urlsMu.Lock()
+				urls[path] = resolved
+				urlsMu.Unlock()
+			}
+		}()
+	}
+
+sendPaths:
+	for _, path := range paths {
+		select {
+		case jobs <- path:
+		case <-ctx.Done():
+			break sendPaths
+		}
+	}
+	close(jobs)
+	workers.Wait()
 	return &pluginv1.ResolveImageURLsResponse{Urls: urls}, nil
+}
+
+func (s *metadataServer) resolveImageURL(ctx context.Context, path, variant string) string {
+	if !strings.HasPrefix(path, "/api/") || !s.runtime.baseURLConfigured {
+		return resolveOneSportarrPath(s.runtime.baseURL, path, variant)
+	}
+	p, err := s.runtime.providerForRequest()
+	if err != nil {
+		slog.Warn("sportarr: image resolution skipped", "path", path, "error", err)
+		return ""
+	}
+	resolved, err := p.ResolveImageRedirect(ctx, path)
+	if err != nil {
+		slog.Warn("sportarr: image redirect resolution failed", "path", path, "error", err)
+		return ""
+	}
+	return resolved
 }
 
 func main() {

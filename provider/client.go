@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -16,6 +18,7 @@ import (
 
 const (
 	defaultBaseURL  = "https://sportarr.net"
+	apiKeyHeader    = "X-Api-Key"
 	maxRetries      = 3
 	maxResponseBody = 2 << 20 // 2 MB
 )
@@ -23,7 +26,9 @@ const (
 type Client struct {
 	httpClient *http.Client
 	baseURL    string
+	apiKey     string
 	limiter    *rate.Limiter
+	lookupIP   func(context.Context, string) ([]net.IP, error)
 }
 
 func NewClient(rateLimit int) *Client {
@@ -34,11 +39,75 @@ func NewClient(rateLimit int) *Client {
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		baseURL:    defaultBaseURL,
 		limiter:    rate.NewLimiter(rate.Limit(rateLimit), rateLimit),
+		lookupIP: func(ctx context.Context, host string) ([]net.IP, error) {
+			return net.DefaultResolver.LookupIP(ctx, "ip", host)
+		},
 	}
 }
 
-func (c *Client) SetBaseURL(url string) {
-	c.baseURL = url
+func (c *Client) SetBaseURL(baseURL string) {
+	c.baseURL = strings.TrimRight(baseURL, "/")
+}
+
+func (c *Client) SetAPIKey(apiKey string) {
+	c.apiKey = strings.TrimSpace(apiKey)
+}
+
+func (c *Client) hasAPIKey() bool {
+	return c.apiKey != ""
+}
+
+// SetHTTPClient replaces the request client. It is primarily useful for
+// callers that need to control transports in tests.
+func (c *Client) SetHTTPClient(httpClient *http.Client) {
+	c.httpClient = httpClient
+}
+
+func (c *Client) requestURL(path string) (string, error) {
+	if !strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "//") {
+		return "", fmt.Errorf("sportarr: request path must start with /api/")
+	}
+	requestPath, err := url.Parse(path)
+	if err != nil || requestPath.IsAbs() || requestPath.Host != "" || requestPath.User != nil || requestPath.Fragment != "" {
+		return "", fmt.Errorf("sportarr: invalid request path")
+	}
+	if !strings.HasPrefix(requestPath.Path, "/api/") || strings.Contains(requestPath.Path, `\`) {
+		return "", fmt.Errorf("sportarr: invalid request path")
+	}
+	for _, segment := range strings.Split(requestPath.Path, "/") {
+		if segment == "." || segment == ".." {
+			return "", fmt.Errorf("sportarr: invalid request path")
+		}
+	}
+
+	base, err := url.Parse(c.baseURL)
+	if err != nil || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || base.Opaque != "" {
+		return "", fmt.Errorf("sportarr: invalid base URL")
+	}
+	switch strings.ToLower(base.Scheme) {
+	case "http", "https":
+	default:
+		return "", fmt.Errorf("sportarr: base URL must use HTTP or HTTPS")
+	}
+
+	// Concatenating the validated absolute API path keeps a configured reverse-
+	// proxy prefix (for example /sportarr) instead of replacing it.
+	requestURL := strings.TrimRight(c.baseURL, "/") + path
+	if _, err := url.ParseRequestURI(requestURL); err != nil {
+		return "", fmt.Errorf("sportarr: invalid request URL: %w", err)
+	}
+	return requestURL, nil
+}
+
+func (c *Client) requestClient() http.Client {
+	client := *c.httpClient
+	// JSON endpoints must not redirect: following an unexpected cross-origin
+	// redirect could disclose the instance API key. Image redirects are handled
+	// separately and are deliberately inspected without being followed.
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return client
 }
 
 func (c *Client) doGet(ctx context.Context, path string, dest any) error {
@@ -46,7 +115,11 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 		return err
 	}
 
-	reqURL := c.baseURL + path
+	reqURL, err := c.requestURL(path)
+	if err != nil {
+		return err
+	}
+	client := c.requestClient()
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
@@ -57,14 +130,17 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 		req.Header.Set("User-Agent", "silo-plugin-sportarr/1.0")
 		req.Header.Set("Cache-Control", "no-cache, no-store")
 		req.Header.Set("Pragma", "no-cache")
+		if c.apiKey != "" {
+			req.Header.Set(apiKeyHeader, c.apiKey)
+		}
 
-		resp, err := c.httpClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			return fmt.Errorf("sportarr: request failed: %w", err)
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if attempt < maxRetries {
 				backoff := retryAfterOrDefault(resp, attempt)
 				slog.Warn("sportarr: rate limited, backing off",
@@ -80,7 +156,7 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 		}
 
 		if resp.StatusCode >= 500 {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			if attempt < maxRetries {
 				backoff := time.Duration(1<<attempt) * time.Second
 				select {
@@ -95,12 +171,16 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			return fmt.Errorf("sportarr: HTTP %d: %s", resp.StatusCode, string(body))
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			_ = resp.Body.Close()
+			return fmt.Errorf("sportarr: unexpected HTTP %d", resp.StatusCode)
 		}
 
 		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(dest)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		if decodeErr != nil {
 			return fmt.Errorf("sportarr: decode response: %w", decodeErr)
 		}
@@ -199,4 +279,132 @@ func (c *Client) GetEntityImagesBatch(ctx context.Context, entityType string, en
 		}
 	}
 	return out
+}
+
+// ResolveImageRedirect returns the public image target supplied by Sportarr's
+// configured local API. It never follows the redirect itself.
+func (c *Client) ResolveImageRedirect(ctx context.Context, path string) (string, error) {
+	if !strings.HasPrefix(path, "/api/") {
+		return "", fmt.Errorf("sportarr: image redirect path must start with /api/")
+	}
+	requestPath, err := url.Parse(path)
+	if err != nil {
+		return "", fmt.Errorf("sportarr: invalid image redirect path")
+	}
+	fragment := requestPath.Fragment
+	requestPath.Fragment = ""
+	path = requestPath.String()
+	if err := c.limiter.Wait(ctx); err != nil {
+		return "", err
+	}
+
+	reqURL, err := c.requestURL(path)
+	if err != nil {
+		return "", err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("sportarr: create image redirect request: %w", err)
+	}
+	if c.apiKey != "" {
+		req.Header.Set(apiKeyHeader, c.apiKey)
+	}
+
+	client := c.requestClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("sportarr: image redirect request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusMultipleChoices || resp.StatusCode >= http.StatusBadRequest {
+		return "", fmt.Errorf("sportarr: image redirect returned HTTP %d", resp.StatusCode)
+	}
+
+	location := resp.Header.Get("Location")
+	target, err := url.Parse(location)
+	if err != nil || !target.IsAbs() || target.Scheme != "https" || target.Host == "" || target.User != nil {
+		return "", fmt.Errorf("sportarr: image redirect location is not a public HTTPS URL")
+	}
+	if port := target.Port(); port != "" {
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return "", fmt.Errorf("sportarr: image redirect location has invalid port")
+		}
+	}
+	if target.Fragment == "" {
+		target.Fragment = fragment
+	}
+
+	host := target.Hostname()
+	if host == "" {
+		return "", fmt.Errorf("sportarr: image redirect location has no host")
+	}
+	if literal := net.ParseIP(host); literal != nil {
+		if !isGloballyRoutableIP(literal) {
+			return "", fmt.Errorf("sportarr: image redirect target is not globally routable")
+		}
+		return target.String(), nil
+	}
+
+	addresses, err := c.lookupIP(ctx, host)
+	if err != nil || len(addresses) == 0 {
+		return "", fmt.Errorf("sportarr: image redirect target lookup failed")
+	}
+	for _, address := range addresses {
+		if !isGloballyRoutableIP(address) {
+			return "", fmt.Errorf("sportarr: image redirect target is not globally routable")
+		}
+	}
+	return target.String(), nil
+}
+
+func isGloballyRoutableIP(ip net.IP) bool {
+	if ip4 := ip.To4(); ip4 != nil {
+		ip = ip4
+	} else if !globallyRoutableIPv6Range.Contains(ip) {
+		return false
+	}
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	for _, blocked := range nonGlobalIPRanges {
+		if blocked.Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
+var nonGlobalIPRanges = []*net.IPNet{
+	mustParseCIDR("0.0.0.0/8"),
+	mustParseCIDR("100.64.0.0/10"),
+	mustParseCIDR("192.0.0.0/24"),
+	mustParseCIDR("192.0.2.0/24"),
+	mustParseCIDR("192.88.99.0/24"),
+	mustParseCIDR("198.18.0.0/15"),
+	mustParseCIDR("198.51.100.0/24"),
+	mustParseCIDR("203.0.113.0/24"),
+	mustParseCIDR("240.0.0.0/4"),
+	mustParseCIDR("64:ff9b:1::/48"),
+	mustParseCIDR("100::/64"),
+	mustParseCIDR("100:0:0:1::/64"),
+	mustParseCIDR("2001::/23"),
+	mustParseCIDR("2001:2::/48"),
+	mustParseCIDR("2001:10::/28"),
+	mustParseCIDR("2001:20::/28"),
+	mustParseCIDR("2001:30::/28"),
+	mustParseCIDR("2002::/16"),
+	mustParseCIDR("2001:db8::/32"),
+	mustParseCIDR("3fff::/20"),
+}
+
+var globallyRoutableIPv6Range = mustParseCIDR("2000::/3")
+
+func mustParseCIDR(cidr string) *net.IPNet {
+	_, network, err := net.ParseCIDR(cidr)
+	if err != nil {
+		panic(err)
+	}
+	return network
 }

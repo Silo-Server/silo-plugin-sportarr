@@ -1,9 +1,17 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	publicmanifest "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/manifest"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 // Sportarr is a specialist provider: sports leagues rendered as TV shows. It
@@ -31,16 +39,26 @@ func TestManifestOptsOutOfDefaultEnable(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected default_priority map, got %T", meta["default_priority"])
 	}
-	// Must still declare the series levels (keeps it scoped to series content
-	// and out of the movie/audiobook fallback), but ranked below TVDB(2)/TMDB(3).
+	// Series metadata remains below TVDB(2)/TMDB(3).
 	for _, level := range []string{"series", "season", "episode"} {
 		p, ok := dp[level].(float64)
 		if !ok {
 			t.Fatalf("expected numeric priority for %q, got %T", level, dp[level])
 		}
-		if p <= 3 {
-			t.Errorf("sportarr %s priority %v must be greater than TMDB(3) so it never out-ranks the general providers", level, p)
+		if p != 50 {
+			t.Errorf("sportarr %s priority = %v, want 50", level, p)
 		}
+	}
+	if _, ok := dp["movie"]; ok {
+		t.Fatal("sportarr must not advertise Movie support before Sportarr publishes that API")
+	}
+
+	presentation := m.GetPresentation()
+	if presentation == nil {
+		t.Fatal("expected presentation metadata")
+	}
+	if got := presentation.GetSetupMarkdown(); got == "" || !containsAll(got, "API key", "protected image API") {
+		t.Errorf("setup must explain when the Sportarr API key is needed, got %q", got)
 	}
 }
 
@@ -61,29 +79,83 @@ func TestManifestLoads(t *testing.T) {
 	if m.Capabilities[0].Type != "metadata_provider.v1" {
 		t.Errorf("expected capability type metadata_provider.v1, got %s", m.Capabilities[0].Type)
 	}
+	if got := m.GetPresentation().GetSourceUrl(); got != "https://github.com/Silo-Server/silo-plugin-metadata-sportarr" {
+		t.Errorf("source URL = %q, want canonical Silo repository", got)
+	}
+}
+
+func TestManifestMarksAPIKeySecret(t *testing.T) {
+	var raw struct {
+		GlobalConfigSchema []struct {
+			JSONSchema string `json:"json_schema"`
+			AdminForm  struct {
+				Fields []struct {
+					Key    string `json:"key"`
+					Secret bool   `json:"secret"`
+				} `json:"fields"`
+			} `json:"admin_form"`
+		} `json:"global_config_schema"`
+	}
+	if err := json.Unmarshal(manifestJSON, &raw); err != nil {
+		t.Fatalf("decode manifest JSON: %v", err)
+	}
+	if len(raw.GlobalConfigSchema) != 1 || !strings.Contains(raw.GlobalConfigSchema[0].JSONSchema, `"api_key"`) {
+		t.Fatal("Sportarr config schema must include api_key")
+	}
+	for _, field := range raw.GlobalConfigSchema[0].AdminForm.Fields {
+		if field.Key == "api_key" {
+			if !field.Secret {
+				t.Fatal("Sportarr api_key must be marked secret")
+			}
+			return
+		}
+	}
+	t.Fatal("Sportarr admin form is missing api_key")
+}
+
+func TestConfigureMarksExplicitBaseURL(t *testing.T) {
+	configured, err := structpb.NewStruct(map[string]any{"base_url": "http://sportarr:1867/"})
+	if err != nil {
+		t.Fatalf("make configured base URL: %v", err)
+	}
+
+	runtime := &runtimeServer{}
+	if _, err := runtime.Configure(context.Background(), &pluginv1.ConfigureRequest{Config: []*pluginv1.ConfigEntry{{Key: "sportarr", Value: configured}}}); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	if !runtime.baseURLConfigured {
+		t.Fatal("explicit Sportarr base URL was not recorded")
+	}
+	if got, want := runtime.baseURL, "http://sportarr:1867"; got != want {
+		t.Fatalf("configured base URL = %q, want %q", got, want)
+	}
 }
 
 func TestSportarrCanonicalPath(t *testing.T) {
-	base := "https://sportarr.net"
-
 	tests := []struct {
 		name     string
+		baseURL  string
 		imageURL string
 		want     string
 	}{
-		{"empty", "", ""},
-		{"full url", "https://sportarr.net/api/images/abc123", "sportarr:///api/images/abc123"},
-		{"relative static path", "/static/images/league/9a/poster.jpg", "sportarr:///static/images/league/9a/poster.jpg"},
-		{"network-path reference", "//example.com/image.jpg", "//example.com/image.jpg"},
-		{"lookalike origin", "https://sportarr.net.example/image.jpg", "https://sportarr.net.example/image.jpg"},
-		{"external url", "https://example.com/image.jpg", "https://example.com/image.jpg"},
+		{"empty", "https://sportarr.net", "", ""},
+		{"full url", "https://sportarr.net", "https://sportarr.net/api/images/abc123", "sportarr:///api/images/abc123"},
+		{"same effective default port", "http://sportarr.local", "http://sportarr.local:80/api/images/abc123", "sportarr:///api/images/abc123"},
+		{"configured local URL", "http://sportarr.local:1867", "http://sportarr.local:1867/api/images/abc123", "sportarr:///api/images/abc123"},
+		{"relative image path", "http://sportarr.local:1867", "/api/v1/images/image-1", "sportarr:///api/v1/images/image-1"},
+		{"scheme-relative host stays external", "http://sportarr.local:1867", "//example.com/api/images/abc123", "//example.com/api/images/abc123"},
+		{"near-prefix port stays external", "http://sportarr.local:1867", "http://sportarr.local:18670/api/images/abc123", "http://sportarr.local:18670/api/images/abc123"},
+		{"base path boundary", "http://sportarr.local:1867/sportarr", "http://sportarr.local:1867/sportarr/images/abc123", "sportarr:///images/abc123"},
+		{"near-prefix base path stays external", "http://sportarr.local:1867/sportarr", "http://sportarr.local:1867/sportarrx/images/abc123", "http://sportarr.local:1867/sportarrx/images/abc123"},
+		{"external url", "https://sportarr.net", "https://example.com/image.jpg", "https://example.com/image.jpg"},
+		{"different scheme stays external", "https://sportarr.local", "http://sportarr.local/api/images/abc123", "http://sportarr.local/api/images/abc123"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := sportarrCanonicalPath(base, tt.imageURL)
+			got := sportarrCanonicalPath(tt.baseURL, tt.imageURL)
 			if got != tt.want {
-				t.Errorf("sportarrCanonicalPath(%q) = %q, want %q", tt.imageURL, got, tt.want)
+				t.Errorf("sportarrCanonicalPath(%q, %q) = %q, want %q", tt.baseURL, tt.imageURL, got, tt.want)
 			}
 		})
 	}
@@ -112,13 +184,20 @@ func TestCanonicalRoundTrip(t *testing.T) {
 			baseURL:   "https://media.example/sportarr",
 			imageURL:  "/static/images/league/9a/badge.png",
 			canonical: "sportarr:///static/images/league/9a/badge.png",
-			resolved:  "https://media.example/static/images/league/9a/badge.png",
+			resolved:  "https://media.example/sportarr/static/images/league/9a/badge.png",
+		},
+		{
+			name:      "root-relative URL already includes subpath base",
+			baseURL:   "https://media.example/sportarr",
+			imageURL:  "/sportarr/static/images/league/9a/badge.png",
+			canonical: "sportarr:///static/images/league/9a/badge.png",
+			resolved:  "https://media.example/sportarr/static/images/league/9a/badge.png",
 		},
 		{
 			name:      "absolute URL under subpath base",
 			baseURL:   "https://media.example/sportarr",
 			imageURL:  "https://media.example/sportarr/static/images/league/9a/badge.png",
-			canonical: "sportarr:///sportarr/static/images/league/9a/badge.png",
+			canonical: "sportarr:///static/images/league/9a/badge.png",
 			resolved:  "https://media.example/sportarr/static/images/league/9a/badge.png",
 		},
 	}
@@ -145,6 +224,7 @@ func TestResolveOneSportarrPath(t *testing.T) {
 	}{
 		{"empty", "", ""},
 		{"canonical", "sportarr:///api/images/abc123", "https://sportarr.net/api/images/abc123"},
+		{"bare path from Silo", "/api/images/abc123", "https://sportarr.net/api/images/abc123"},
 		{"reject canonical network-path reference", "sportarr:////example.com/image.jpg", "sportarr:////example.com/image.jpg"},
 		{"full url passthrough", "https://example.com/image.jpg", "https://example.com/image.jpg"},
 	}
@@ -157,4 +237,131 @@ func TestResolveOneSportarrPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDefaultHubImageRPCResolvesBarePath(t *testing.T) {
+	server := &metadataServer{runtime: &runtimeServer{baseURL: defaultBaseURL}}
+	response, err := server.ResolveImageURL(context.Background(), &pluginv1.ResolveImageURLRequest{
+		Path: "/api/images/league/formula-1/poster",
+	})
+	if err != nil {
+		t.Fatalf("resolve default-hub image: %v", err)
+	}
+	if got, want := response.GetUrl(), defaultBaseURL+"/api/images/league/formula-1/poster"; got != want {
+		t.Fatalf("resolved default-hub URL = %q, want %q", got, want)
+	}
+}
+
+func TestConfiguredImageRPCAuthenticatesAndPreservesBasePath(t *testing.T) {
+	const apiKey = "sportarr-secret"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/sportarr/api/v1/images/image-1"; got != want {
+			t.Errorf("image redirect path = %q, want %q", got, want)
+		}
+		if got := r.Header.Get("X-Api-Key"); got != apiKey {
+			t.Errorf("X-Api-Key = %q, want configured key", got)
+		}
+		w.Header().Set("Location", "https://8.8.8.8/formula-1.jpg")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	configured, err := structpb.NewStruct(map[string]any{
+		"base_url": srv.URL + "/sportarr/",
+		"api_key":  "  " + apiKey + "  ",
+	})
+	if err != nil {
+		t.Fatalf("make Sportarr config: %v", err)
+	}
+	runtime := &runtimeServer{}
+	if _, err := runtime.Configure(context.Background(), &pluginv1.ConfigureRequest{Config: []*pluginv1.ConfigEntry{{Key: "sportarr", Value: configured}}}); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	server := &metadataServer{runtime: runtime}
+	response, err := server.ResolveImageURL(context.Background(), &pluginv1.ResolveImageURLRequest{
+		// Silo strips sportarr:// before invoking the plugin resolver.
+		Path: "/api/v1/images/image-1",
+	})
+	if err != nil {
+		t.Fatalf("resolve configured image: %v", err)
+	}
+	if got, want := response.GetUrl(), "https://8.8.8.8/formula-1.jpg"; got != want {
+		t.Fatalf("resolved configured URL = %q, want %q", got, want)
+	}
+}
+
+func TestConfiguredImageBatchResolvesConcurrently(t *testing.T) {
+	arrivals := make(chan struct{}, 2)
+	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrivals <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Location", "https://8.8.8.8"+r.URL.Path+".jpg")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	configured, err := structpb.NewStruct(map[string]any{
+		"base_url": srv.URL,
+		"api_key":  "sportarr-secret",
+	})
+	if err != nil {
+		t.Fatalf("make Sportarr config: %v", err)
+	}
+	runtime := &runtimeServer{}
+	if _, err := runtime.Configure(context.Background(), &pluginv1.ConfigureRequest{Config: []*pluginv1.ConfigEntry{{Key: "sportarr", Value: configured}}}); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	server := &metadataServer{runtime: runtime}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan *pluginv1.ResolveImageURLsResponse, 1)
+	go func() {
+		response, _ := server.ResolveImageURLs(ctx, &pluginv1.ResolveImageURLsRequest{
+			Paths: []string{"/api/v1/images/image-1", "/api/v1/images/image-2"},
+		})
+		done <- response
+	}()
+
+	for range 2 {
+		select {
+		case <-arrivals:
+		case <-ctx.Done():
+			t.Fatal("batch image redirects were not in flight concurrently")
+		}
+	}
+	close(release)
+
+	select {
+	case response := <-done:
+		for _, path := range []string{"/api/v1/images/image-1", "/api/v1/images/image-2"} {
+			if response.GetUrls()[path] == "" {
+				t.Fatalf("batch response omitted resolved URL for %q", path)
+			}
+		}
+	case <-ctx.Done():
+		t.Fatal("batch image redirect resolution did not complete")
+	}
+}
+
+func containsAll(value string, needles ...string) bool {
+	for _, needle := range needles {
+		if !strings.Contains(value, needle) {
+			return false
+		}
+	}
+	return true
 }
