@@ -160,6 +160,52 @@ func TestSportarrCanonicalPath(t *testing.T) {
 	}
 }
 
+// TestCanonicalRoundTrip ensures both absolute and root-relative image URLs the
+// Sportarr API returns survive the canonicalize→store→resolve round trip and
+// come back as fetchable absolute URLs.
+func TestCanonicalRoundTrip(t *testing.T) {
+	tests := []struct {
+		name      string
+		baseURL   string
+		imageURL  string
+		canonical string
+		resolved  string
+	}{
+		{
+			name:      "absolute URL on origin",
+			baseURL:   "https://sportarr.net",
+			imageURL:  "https://sportarr.net/static/images/league/9a/poster.jpg",
+			canonical: "sportarr:///static/images/league/9a/poster.jpg",
+			resolved:  "https://sportarr.net/static/images/league/9a/poster.jpg",
+		},
+		{
+			name:      "root-relative URL with subpath base",
+			baseURL:   "https://media.example/sportarr",
+			imageURL:  "/static/images/league/9a/badge.png",
+			canonical: "sportarr:///static/images/league/9a/badge.png",
+			resolved:  "https://media.example/sportarr/static/images/league/9a/badge.png",
+		},
+		{
+			name:      "absolute URL under subpath base",
+			baseURL:   "https://media.example/sportarr",
+			imageURL:  "https://media.example/sportarr/static/images/league/9a/badge.png",
+			canonical: "sportarr:///static/images/league/9a/badge.png",
+			resolved:  "https://media.example/sportarr/static/images/league/9a/badge.png",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			canonical := sportarrCanonicalPath(tt.baseURL, tt.imageURL)
+			if canonical != tt.canonical {
+				t.Fatalf("canonical path = %q, want %q", canonical, tt.canonical)
+			}
+			if resolved := resolveOneSportarrPath(tt.baseURL, canonical, ""); resolved != tt.resolved {
+				t.Errorf("resolved URL = %q, want %q", resolved, tt.resolved)
+			}
+		})
+	}
+}
+
 func TestResolveOneSportarrPath(t *testing.T) {
 	base := "https://sportarr.net"
 
@@ -170,9 +216,8 @@ func TestResolveOneSportarrPath(t *testing.T) {
 	}{
 		{"empty", "", ""},
 		{"canonical", "sportarr:///api/images/abc123", "https://sportarr.net/api/images/abc123"},
-		// Silo strips the plugin scheme before calling ResolveImageURL. The
-		// resolver must therefore accept the bare path it receives over RPC.
 		{"bare path from Silo", "/api/images/abc123", "https://sportarr.net/api/images/abc123"},
+		{"reject canonical network-path reference", "sportarr:////example.com/image.jpg", "sportarr:////example.com/image.jpg"},
 		{"full url passthrough", "https://example.com/image.jpg", "https://example.com/image.jpg"},
 	}
 

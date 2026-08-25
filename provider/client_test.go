@@ -21,7 +21,7 @@ func TestSearchParsesResponse(t *testing.T) {
 		}
 		if err := json.NewEncoder(w).Encode(AgentSearchResponse{
 			Results: []AgentSearchResult{
-				{ID: "abc-123", Title: "NFL Football", Year: 2024, PosterURL: "https://sportarr.net/img/nfl.jpg"},
+				{ID: "lg-000123", HubID: "abc-uuid", Title: "NFL Football", Year: 2024, PosterURL: "https://sportarr.net/static/images/nfl.jpg"},
 			},
 		}); err != nil {
 			t.Errorf("encode series search response: %v", err)
@@ -39,8 +39,8 @@ func TestSearchParsesResponse(t *testing.T) {
 	if len(resp.Results) != 1 {
 		t.Fatalf("expected 1 result, got %d", len(resp.Results))
 	}
-	if resp.Results[0].ID != "abc-123" {
-		t.Errorf("expected ID abc-123, got %s", resp.Results[0].ID)
+	if resp.Results[0].HubID != "abc-uuid" {
+		t.Errorf("expected hub_id abc-uuid, got %s", resp.Results[0].HubID)
 	}
 	if resp.Results[0].Title != "NFL Football" {
 		t.Errorf("expected title NFL Football, got %s", resp.Results[0].Title)
@@ -195,7 +195,7 @@ func TestNoCacheHeaders(t *testing.T) {
 func TestGetEntityImagesParsesResponse(t *testing.T) {
 	const apiKey = "sportarr-secret"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/sportarr/api/v1/images/entity/league/abc-123" {
+		if r.URL.Path != "/sportarr/api/v1/images/entity/league/abc-uuid" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 		if got := r.Header.Get(apiKeyHeader); got != apiKey {
@@ -209,14 +209,14 @@ func TestGetEntityImagesParsesResponse(t *testing.T) {
 				{
 					ID:        "img-1",
 					ImageType: "poster",
-					URL:       "https://sportarr.net/api/v1/images/img-1",
+					URL:       "/static/images/league/img-1.jpg",
 					IsPrimary: true,
 					Priority:  10,
 				},
 				{
 					ID:        "img-2",
 					ImageType: "backdrop",
-					URL:       "https://sportarr.net/api/v1/images/img-2",
+					URL:       "/static/images/league/img-2.jpg",
 					Priority:  5,
 				},
 			},
@@ -230,7 +230,7 @@ func TestGetEntityImagesParsesResponse(t *testing.T) {
 	c.SetBaseURL(srv.URL + "/sportarr/")
 	c.SetAPIKey("  " + apiKey + "  ")
 
-	resp, err := c.GetEntityImages(context.Background(), "league", "abc-123")
+	resp, err := c.GetEntityImages(context.Background(), "league", "abc-uuid")
 	if err != nil {
 		t.Fatalf("get entity images failed: %v", err)
 	}
@@ -246,7 +246,7 @@ func TestGetEntityImagesParsesResponse(t *testing.T) {
 	if !resp.Images[0].IsPrimary {
 		t.Errorf("expected is_primary=true")
 	}
-	if resp.Images[1].URL != "https://sportarr.net/api/v1/images/img-2" {
+	if resp.Images[1].URL != "/static/images/league/img-2.jpg" {
 		t.Errorf("unexpected URL: %s", resp.Images[1].URL)
 	}
 }
