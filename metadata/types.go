@@ -11,7 +11,6 @@ type SearchQuery struct {
 type SearchResult struct {
 	Name        string
 	Year        int
-	ReleaseDate string
 	ProviderIDs map[string]string
 	ImageURL    string
 	Overview    string
@@ -26,33 +25,31 @@ type MetadataRequest struct {
 }
 
 type MetadataResult struct {
-	HasMetadata       bool
-	ProviderIDs       map[string]string
-	Title             string
-	OriginalTitle     string
-	SortTitle         string
-	Overview          string
-	Tagline           string
-	Year              int
-	ReleaseDate       string
-	Runtime           int
-	Genres            []string
-	Studios           []string
-	Networks          []string
-	Countries         []string
-	OriginalLanguage  string
-	ContentRating     string
-	Ratings           Ratings
-	PosterPath        string
-	PosterThumbhash   string
-	BackdropPath      string
+	HasMetadata      bool
+	ProviderIDs      map[string]string
+	Title            string
+	OriginalTitle    string
+	SortTitle        string
+	Overview         string
+	Tagline          string
+	Year             int
+	Runtime          int
+	Genres           []string
+	Studios          []string
+	Networks         []string
+	Countries        []string
+	OriginalLanguage string
+	ContentRating    string
+	Ratings          Ratings
+	PosterPath       string
+	PosterThumbhash  string
+	BackdropPath     string
 	BackdropThumbhash string
-	LogoPath          string
-	StillPath         string
-	SeasonCount       int
-	FirstAirDate      string
-	LastAirDate       string
-	AirTime           string
+	LogoPath         string
+	SeasonCount      int
+	FirstAirDate     string
+	LastAirDate      string
+	AirTime          string
 }
 
 type Ratings struct {

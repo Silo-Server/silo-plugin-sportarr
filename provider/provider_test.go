@@ -23,7 +23,24 @@ func newTestProvider(t *testing.T, handler http.Handler) *Provider {
 	t.Cleanup(srv.Close)
 	c := NewClient(100)
 	c.SetBaseURL(srv.URL)
+	c.SetAPIKey("test-sportarr-key")
 	return NewProviderWithClient(c)
+}
+
+func newTestProviderWithoutAPIKey(t *testing.T, handler http.Handler) *Provider {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	c := NewClient(100)
+	c.SetBaseURL(srv.URL)
+	return NewProviderWithClient(c)
+}
+
+func TestProviderOnlyAdvertisesReleasedSeriesContract(t *testing.T) {
+	p := NewProvider("")
+	if got := p.ForTypes(); len(got) != 1 || got[0] != "series" {
+		t.Fatalf("ForTypes() = %v, want only series", got)
+	}
 }
 
 func TestSearchByTitle(t *testing.T) {
@@ -133,6 +150,38 @@ func TestGetMetadata(t *testing.T) {
 	}
 }
 
+func TestGetMetadataUsesPublicAgentArtworkWithoutAPIKey(t *testing.T) {
+	p := newTestProviderWithoutAPIKey(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/metadata/agents/series/league-1":
+			encodeJSON(t, w, AgentSeriesResponse{
+				Title:     "Formula 1",
+				PosterURL: "https://images.example/formula-1-poster.jpg",
+				FanartURL: "https://images.example/formula-1-fanart.jpg",
+			})
+		case "/api/metadata/agents/series/league-1/seasons":
+			encodeJSON(t, w, AgentSeasonsResponse{})
+		default:
+			t.Errorf("unexpected request without an API key: %s", r.URL.Path)
+			w.WriteHeader(http.StatusUnauthorized)
+		}
+	}))
+
+	result, err := p.GetMetadata(context.Background(), metadata.MetadataRequest{
+		ProviderIDs: map[string]string{"sportarr": "league-1"},
+		ContentType: "series",
+	})
+	if err != nil {
+		t.Fatalf("get metadata without API key: %v", err)
+	}
+	if got, want := result.PosterPath, "https://images.example/formula-1-poster.jpg"; got != want {
+		t.Fatalf("poster path = %q, want public agent artwork %q", got, want)
+	}
+	if got, want := result.BackdropPath, "https://images.example/formula-1-fanart.jpg"; got != want {
+		t.Fatalf("backdrop path = %q, want public agent artwork %q", got, want)
+	}
+}
+
 func TestGetSeasons(t *testing.T) {
 	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -189,7 +238,7 @@ func TestGetSeasonsWithoutCompetitionSeasonID(t *testing.T) {
 		case "/api/metadata/agents/series/league-1/seasons":
 			encodeJSON(t, w, AgentSeasonsResponse{
 				Seasons: []AgentSeason{
-					{SeasonNumber: 2023, Name: "2023 Season"},
+					{SeasonNumber: 2023, Title: "2023 Season", PosterURL: "https://images.example/2023.jpg"},
 				},
 			})
 		default:
@@ -207,8 +256,11 @@ func TestGetSeasonsWithoutCompetitionSeasonID(t *testing.T) {
 	if len(seasons) != 1 {
 		t.Fatalf("expected 1 season, got %d", len(seasons))
 	}
-	if seasons[0].PosterPath != "" {
-		t.Errorf("expected empty poster path when no CompetitionSeasonID, got %s", seasons[0].PosterPath)
+	if seasons[0].Title != "2023 Season" {
+		t.Errorf("expected released agent title field, got %q", seasons[0].Title)
+	}
+	if seasons[0].PosterPath != "https://images.example/2023.jpg" {
+		t.Errorf("expected public agent poster without CompetitionSeasonID, got %s", seasons[0].PosterPath)
 	}
 }
 
@@ -273,6 +325,57 @@ func TestGetImagesForSeries(t *testing.T) {
 	}
 	if images[0].Width != 680 || images[0].Height != 1000 {
 		t.Errorf("expected 680x1000, got %dx%d", images[0].Width, images[0].Height)
+	}
+}
+
+func TestGetImagesUsesPublicSeriesArtworkWithoutAPIKey(t *testing.T) {
+	p := newTestProviderWithoutAPIKey(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/metadata/agents/series/league-1" {
+			t.Errorf("unexpected request without API key: %s", r.URL.Path)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		encodeJSON(t, w, AgentSeriesResponse{
+			PosterURL: "https://images.example/formula-1-poster.jpg",
+			BannerURL: "https://images.example/formula-1-banner.jpg",
+			FanartURL: "https://images.example/formula-1-fanart.jpg",
+		})
+	}))
+
+	images, err := p.GetImages(context.Background(), metadata.ImageRequest{
+		ProviderIDs: map[string]string{"sportarr": "league-1"},
+		ContentType: "series",
+	})
+	if err != nil {
+		t.Fatalf("get public series images: %v", err)
+	}
+	if len(images) != 3 || images[0].Type != metadata.ImagePoster || images[1].Type != metadata.ImageBackdrop || images[2].Type != metadata.ImageBanner {
+		t.Fatalf("unexpected public series artwork: %+v", images)
+	}
+}
+
+func TestGetImagesFallsBackToPublicSeriesArtworkAfterUnauthorizedEntityAPI(t *testing.T) {
+	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/images/entity/league/league-1":
+			w.WriteHeader(http.StatusUnauthorized)
+		case "/api/metadata/agents/series/league-1":
+			encodeJSON(t, w, AgentSeriesResponse{PosterURL: "https://images.example/formula-1-poster.jpg"})
+		default:
+			t.Errorf("unexpected fallback request: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+
+	images, err := p.GetImages(context.Background(), metadata.ImageRequest{
+		ProviderIDs: map[string]string{"sportarr": "league-1"},
+		ContentType: "series",
+	})
+	if err != nil {
+		t.Fatalf("get series images after entity API 401: %v", err)
+	}
+	if len(images) != 1 || images[0].URL != "https://images.example/formula-1-poster.jpg" {
+		t.Fatalf("unexpected fallback artwork: %+v", images)
 	}
 }
 
@@ -450,237 +553,5 @@ func TestEntityImagesToRemoteEmpty(t *testing.T) {
 	result := entityImagesToRemote(nil)
 	if len(result) != 0 {
 		t.Errorf("expected empty result, got %d", len(result))
-	}
-}
-
-type roundTripperFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
-}
-
-func TestMovieSearchRequiresLocalURLTitleAndYear(t *testing.T) {
-	c := NewClient(100)
-	c.httpClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		t.Fatalf("Movie request must not use the default hub URL: %s", req.URL)
-		return nil, nil
-	})
-	p := NewProviderWithClient(c)
-
-	if got := p.ForTypes(); len(got) != 2 || got[0] != "series" || got[1] != "movie" {
-		t.Fatalf("ForTypes() = %v, want series and movie", got)
-	}
-	results, err := p.Search(context.Background(), metadata.SearchQuery{
-		ContentType: "movie",
-		Title:       "UFC 300",
-		Year:        2024,
-	})
-	if err != nil || results != nil {
-		t.Fatalf("default hub Movie search = (%v, %v), want (nil, nil)", results, err)
-	}
-
-	p = newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Fatal("Movie search must require both title and year")
-	}))
-	for _, query := range []metadata.SearchQuery{
-		{ContentType: "movie", Title: "UFC 300"},
-		{ContentType: "movie", Year: 2024},
-	} {
-		results, err := p.Search(context.Background(), query)
-		if err != nil || results != nil {
-			t.Fatalf("incomplete Movie search = (%v, %v), want (nil, nil)", results, err)
-		}
-	}
-}
-
-func TestMovieSearchRejectsPublicHubURLVariants(t *testing.T) {
-	for _, baseURL := range []string{
-		"https://sportarr.net:443",
-		"https://SPORTARR.NET",
-		"http://sportarr.net",
-		"http://sportarr.net:80",
-	} {
-		t.Run(baseURL, func(t *testing.T) {
-			c := NewClient(100)
-			c.SetBaseURL(baseURL)
-			c.httpClient.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-				t.Fatalf("Movie request must not use public Sportarr URL %q", baseURL)
-				return nil, nil
-			})
-			p := NewProviderWithClient(c)
-
-			results, err := p.Search(context.Background(), metadata.SearchQuery{
-				ContentType: "movie",
-				Title:       "UFC 300",
-				Year:        2024,
-			})
-			if err != nil || results != nil {
-				t.Fatalf("Movie search for public URL %q = (%v, %v), want (nil, nil)", baseURL, results, err)
-			}
-		})
-	}
-}
-
-func TestMovieSearchUsesMovieAgent(t *testing.T) {
-	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/metadata/agents/movies/search" {
-			t.Errorf("expected Movie search path, got %s", r.URL.Path)
-		}
-		if got := r.URL.Query().Get("title"); got != "UFC 300" {
-			t.Errorf("title = %q, want UFC 300", got)
-		}
-		if got := r.URL.Query().Get("year"); got != "2024" {
-			t.Errorf("year = %q, want 2024", got)
-		}
-		encodeJSON(t, w, AgentMovieSearchResponse{Results: []AgentMovieSearchResult{{
-			ID: "v1.event-key", Title: "UFC 300", Year: 2024, Summary: "A title fight card.", PosterURL: "https://sportarr.local/poster",
-		}}})
-	}))
-
-	results, err := p.Search(context.Background(), metadata.SearchQuery{
-		ContentType: "movie", Title: "UFC 300", Year: 2024,
-	})
-	if err != nil {
-		t.Fatalf("Movie search failed: %v", err)
-	}
-	if len(results) != 1 {
-		t.Fatalf("expected one Movie result, got %d", len(results))
-	}
-	if got := results[0]; got.ProviderIDs["sportarr"] != "v1.event-key" || got.Overview != "A title fight card." || got.ImageURL != "https://sportarr.local/poster" {
-		t.Errorf("unexpected Movie search result: %+v", got)
-	}
-}
-
-func TestMovieSearchByProviderIDFetchesDetail(t *testing.T) {
-	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/metadata/agents/movies/v1.event-key" {
-			t.Errorf("expected Movie detail path, got %s", r.URL.Path)
-		}
-		encodeJSON(t, w, AgentMovieResponse{
-			ID: "v1.event-key", Title: "UFC 300", Year: 2024, Summary: "A title fight card.", PosterURL: "https://sportarr.local/poster",
-		})
-	}))
-
-	results, err := p.Search(context.Background(), metadata.SearchQuery{
-		ContentType: "movie", ProviderIDs: map[string]string{"sportarr": "v1.event-key"},
-	})
-	if err != nil {
-		t.Fatalf("Movie provider-ID search failed: %v", err)
-	}
-	if len(results) != 1 || results[0].Name != "UFC 300" {
-		t.Fatalf("unexpected Movie provider-ID search result: %+v", results)
-	}
-}
-
-func TestMovieSearchByProviderIDFallsBackToConservativeSearch(t *testing.T) {
-	requests := 0
-	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
-		switch r.URL.Path {
-		case "/api/metadata/agents/movies/v1.stale-key":
-			w.WriteHeader(http.StatusNotFound)
-		case "/api/metadata/agents/movies/search":
-			if got := r.URL.Query().Get("title"); got != "UFC 300" {
-				t.Errorf("fallback title = %q, want UFC 300", got)
-			}
-			if got := r.URL.Query().Get("year"); got != "2024" {
-				t.Errorf("fallback year = %q, want 2024", got)
-			}
-			encodeJSON(t, w, AgentMovieSearchResponse{Results: []AgentMovieSearchResult{{ID: "v1.current-key", Title: "UFC 300", Year: 2024}}})
-		default:
-			t.Errorf("unexpected Movie request: %s", r.URL.Path)
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-
-	results, err := p.Search(context.Background(), metadata.SearchQuery{
-		ContentType: "movie", Title: "UFC 300", Year: 2024, ProviderIDs: map[string]string{"sportarr": "v1.stale-key"},
-	})
-	if err != nil {
-		t.Fatalf("Movie fallback search failed: %v", err)
-	}
-	if requests != 2 || len(results) != 1 || results[0].ProviderIDs["sportarr"] != "v1.current-key" {
-		t.Fatalf("unexpected Movie fallback result after %d requests: %+v", requests, results)
-	}
-}
-
-func TestGetMovieMetadataMapsReleaseDateAndTypedArtwork(t *testing.T) {
-	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/metadata/agents/movies/v1.event-key" {
-			t.Errorf("expected Movie detail path, got %s", r.URL.Path)
-		}
-		encodeJSON(t, w, AgentMovieResponse{
-			ID:          "v1.event-key",
-			Title:       "UFC 300",
-			SortTitle:   "UFC 300",
-			Year:        2024,
-			ReleaseDate: "2024-04-13",
-			Summary:     "A title fight card.",
-			Studio:      "UFC",
-			Genres:      []string{"MMA", "Sports"},
-			PosterURL:   "https://sportarr.local/poster",
-			BackdropURL: "https://sportarr.local/backdrop",
-			StillURL:    "https://sportarr.local/still",
-		})
-	}))
-
-	result, err := p.GetMetadata(context.Background(), metadata.MetadataRequest{
-		ContentType: "movie", ProviderIDs: map[string]string{"sportarr": "v1.event-key"},
-	})
-	if err != nil {
-		t.Fatalf("get Movie metadata failed: %v", err)
-	}
-	if result == nil || !result.HasMetadata {
-		t.Fatal("expected Movie metadata")
-	}
-	if got := result; got.ReleaseDate != "2024-04-13" || got.Title != "UFC 300" || got.Overview != "A title fight card." || got.SortTitle != "UFC 300" || len(got.Studios) != 1 || got.Studios[0] != "UFC" || len(got.Genres) != 2 || got.PosterPath == "" || got.BackdropPath == "" || got.StillPath == "" {
-		t.Errorf("unexpected Movie metadata: %+v", got)
-	}
-}
-
-func TestGetMovieMetadataReturnsNilOnNotFound(t *testing.T) {
-	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-
-	result, err := p.GetMetadata(context.Background(), metadata.MetadataRequest{
-		ContentType: "movie", ProviderIDs: map[string]string{"sportarr": "v1.missing"},
-	})
-	if err != nil || result != nil {
-		t.Fatalf("missing Movie metadata = (%v, %v), want (nil, nil)", result, err)
-	}
-}
-
-func TestGetMovieImagesUsesDetailArtwork(t *testing.T) {
-	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/metadata/agents/movies/v1.event-key" {
-			t.Errorf("expected Movie detail path, got %s", r.URL.Path)
-		}
-		encodeJSON(t, w, AgentMovieResponse{
-			PosterURL: "https://sportarr.local/poster", BackdropURL: "https://sportarr.local/backdrop", StillURL: "https://sportarr.local/still",
-		})
-	}))
-
-	images, err := p.GetImages(context.Background(), metadata.ImageRequest{
-		ContentType: "movie", ProviderIDs: map[string]string{"sportarr": "v1.event-key"},
-	})
-	if err != nil {
-		t.Fatalf("get Movie images failed: %v", err)
-	}
-	if len(images) != 3 || images[0].Type != metadata.ImagePoster || images[0].URL != "https://sportarr.local/poster" || images[1].Type != metadata.ImageBackdrop || images[2].Type != metadata.ImageStill {
-		t.Fatalf("unexpected Movie images: %+v", images)
-	}
-}
-
-func TestGetMovieImagesReturnsNilOnNotFound(t *testing.T) {
-	p := newTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
-
-	images, err := p.GetImages(context.Background(), metadata.ImageRequest{
-		ContentType: "movie", ProviderIDs: map[string]string{"sportarr": "v1.missing"},
-	})
-	if err != nil || images != nil {
-		t.Fatalf("missing Movie images = (%v, %v), want (nil, nil)", images, err)
 	}
 }

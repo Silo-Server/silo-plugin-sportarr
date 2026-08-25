@@ -12,36 +12,6 @@ type AgentSearchResult struct {
 	PosterURL string `json:"poster_url"`
 }
 
-// AgentMovieSearchResponse is returned by GET /api/metadata/agents/movies/search.
-type AgentMovieSearchResponse struct {
-	Results []AgentMovieSearchResult `json:"results"`
-}
-
-type AgentMovieSearchResult struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Year        int    `json:"year"`
-	ReleaseDate string `json:"release_date"`
-	Summary     string `json:"summary"`
-	Studio      string `json:"studio"`
-	PosterURL   string `json:"poster_url"`
-}
-
-// AgentMovieResponse is returned by GET /api/metadata/agents/movies/{provider_id}.
-type AgentMovieResponse struct {
-	ID          string   `json:"id"`
-	Title       string   `json:"title"`
-	SortTitle   string   `json:"sort_title"`
-	Year        int      `json:"year"`
-	ReleaseDate string   `json:"release_date"`
-	Summary     string   `json:"summary"`
-	Studio      string   `json:"studio"`
-	Genres      []string `json:"genres"`
-	PosterURL   string   `json:"poster_url"`
-	BackdropURL string   `json:"backdrop_url"`
-	StillURL    string   `json:"still_url"`
-}
-
 // AgentSeriesResponse is returned by GET /api/metadata/agents/series/{league_id}.
 type AgentSeriesResponse struct {
 	Title         string   `json:"title"`
@@ -51,6 +21,8 @@ type AgentSeriesResponse struct {
 	Genres        []string `json:"genres"`
 	Studio        string   `json:"studio"`
 	PosterURL     string   `json:"poster_url"`
+	BannerURL     string   `json:"banner_url"`
+	FanartURL     string   `json:"fanart_url"`
 }
 
 // AgentSeasonsResponse is returned by GET /api/metadata/agents/series/{league_id}/seasons.
@@ -62,6 +34,8 @@ type AgentSeason struct {
 	CompetitionSeasonID string `json:"competition_season_id"`
 	SeasonNumber        int    `json:"season_number"`
 	Name                string `json:"name"`
+	Title               string `json:"title"`
+	PosterURL           string `json:"poster_url"`
 	EpisodeCount        int    `json:"episode_count"`
 }
 

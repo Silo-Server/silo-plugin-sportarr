@@ -10,8 +10,6 @@ import (
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	publicmanifest "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/manifest"
-	"github.com/Silo-Server/silo-plugin-sportarr/metadata"
-	"github.com/Silo-Server/silo-plugin-sportarr/provider"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -40,10 +38,8 @@ func TestManifestOptsOutOfDefaultEnable(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected default_priority map, got %T", meta["default_priority"])
 	}
-	// Series metadata remains below TVDB(2)/TMDB(3). Movie metadata is an
-	// explicitly configured local integration, so it stays well below general
-	// movie providers as well.
-	for _, level := range []string{"series", "season", "episode", "movie"} {
+	// Series metadata remains below TVDB(2)/TMDB(3).
+	for _, level := range []string{"series", "season", "episode"} {
 		p, ok := dp[level].(float64)
 		if !ok {
 			t.Fatalf("expected numeric priority for %q, got %T", level, dp[level])
@@ -52,16 +48,16 @@ func TestManifestOptsOutOfDefaultEnable(t *testing.T) {
 			t.Errorf("sportarr %s priority = %v, want 50", level, p)
 		}
 	}
+	if _, ok := dp["movie"]; ok {
+		t.Fatal("sportarr must not advertise Movie support before Sportarr publishes that API")
+	}
 
 	presentation := m.GetPresentation()
 	if presentation == nil {
 		t.Fatal("expected presentation metadata")
 	}
-	if got := presentation.GetDescriptionMarkdown(); got == "" || !containsAll(got, "Movie", "local Sportarr base_url") {
-		t.Errorf("description must explain that Movie metadata requires a configured local Sportarr base_url, got %q", got)
-	}
-	if got := presentation.GetSetupMarkdown(); got == "" || !containsAll(got, "Movie", "local Sportarr base_url", "default hub") {
-		t.Errorf("setup must explain that Movie metadata requires a configured local Sportarr base_url rather than the default hub, got %q", got)
+	if got := presentation.GetSetupMarkdown(); got == "" || !containsAll(got, "API key", "protected image API") {
+		t.Errorf("setup must explain when the Sportarr API key is needed, got %q", got)
 	}
 }
 
@@ -82,9 +78,41 @@ func TestManifestLoads(t *testing.T) {
 	if m.Capabilities[0].Type != "metadata_provider.v1" {
 		t.Errorf("expected capability type metadata_provider.v1, got %s", m.Capabilities[0].Type)
 	}
+	if got := m.GetPresentation().GetSourceUrl(); got != "https://github.com/Silo-Server/silo-plugin-metadata-sportarr" {
+		t.Errorf("source URL = %q, want canonical Silo repository", got)
+	}
 }
 
-func TestConfigureMarksExplicitMovieBaseURL(t *testing.T) {
+func TestManifestMarksAPIKeySecret(t *testing.T) {
+	var raw struct {
+		GlobalConfigSchema []struct {
+			JSONSchema string `json:"json_schema"`
+			AdminForm  struct {
+				Fields []struct {
+					Key    string `json:"key"`
+					Secret bool   `json:"secret"`
+				} `json:"fields"`
+			} `json:"admin_form"`
+		} `json:"global_config_schema"`
+	}
+	if err := json.Unmarshal(manifestJSON, &raw); err != nil {
+		t.Fatalf("decode manifest JSON: %v", err)
+	}
+	if len(raw.GlobalConfigSchema) != 1 || !strings.Contains(raw.GlobalConfigSchema[0].JSONSchema, `"api_key"`) {
+		t.Fatal("Sportarr config schema must include api_key")
+	}
+	for _, field := range raw.GlobalConfigSchema[0].AdminForm.Fields {
+		if field.Key == "api_key" {
+			if !field.Secret {
+				t.Fatal("Sportarr api_key must be marked secret")
+			}
+			return
+		}
+	}
+	t.Fatal("Sportarr admin form is missing api_key")
+}
+
+func TestConfigureMarksExplicitBaseURL(t *testing.T) {
 	configured, err := structpb.NewStruct(map[string]any{"base_url": "http://sportarr:1867/"})
 	if err != nil {
 		t.Fatalf("make configured base URL: %v", err)
@@ -94,8 +122,8 @@ func TestConfigureMarksExplicitMovieBaseURL(t *testing.T) {
 	if _, err := runtime.Configure(context.Background(), &pluginv1.ConfigureRequest{Config: []*pluginv1.ConfigEntry{{Key: "sportarr", Value: configured}}}); err != nil {
 		t.Fatalf("configure: %v", err)
 	}
-	if !runtime.movieBaseURLConfigured {
-		t.Fatal("explicit local Movie base URL was not recorded")
+	if !runtime.baseURLConfigured {
+		t.Fatal("explicit Sportarr base URL was not recorded")
 	}
 	if got, want := runtime.baseURL, "http://sportarr:1867"; got != want {
 		t.Fatalf("configured base URL = %q, want %q", got, want)
@@ -113,7 +141,7 @@ func TestSportarrCanonicalPath(t *testing.T) {
 		{"full url", "https://sportarr.net", "https://sportarr.net/api/images/abc123", "sportarr:///api/images/abc123"},
 		{"same effective default port", "http://sportarr.local", "http://sportarr.local:80/api/images/abc123", "sportarr:///api/images/abc123"},
 		{"configured local URL", "http://sportarr.local:1867", "http://sportarr.local:1867/api/images/abc123", "sportarr:///api/images/abc123"},
-		{"relative Movie image path", "http://sportarr.local:1867", "/api/metadata/agents/movies/v1.ufc-300/images/poster", "sportarr:///api/metadata/agents/movies/v1.ufc-300/images/poster"},
+		{"relative image path", "http://sportarr.local:1867", "/api/v1/images/image-1", "sportarr:///api/v1/images/image-1"},
 		{"scheme-relative host stays external", "http://sportarr.local:1867", "//example.com/api/images/abc123", "//example.com/api/images/abc123"},
 		{"near-prefix port stays external", "http://sportarr.local:1867", "http://sportarr.local:18670/api/images/abc123", "http://sportarr.local:18670/api/images/abc123"},
 		{"base path boundary", "http://sportarr.local:1867/sportarr", "http://sportarr.local:1867/sportarr/images/abc123", "sportarr:///images/abc123"},
@@ -158,90 +186,54 @@ func TestResolveOneSportarrPath(t *testing.T) {
 	}
 }
 
-func TestMovieMetadataItemMapsReleaseDateAndCanonicalLocalImages(t *testing.T) {
-	const baseURL = "http://sportarr.local:1867"
-	item, err := metadataItemFromResult(&metadata.MetadataResult{
-		ProviderIDs:  map[string]string{"sportarr": "v1.ufc-300"},
-		Title:        "UFC 300",
-		ReleaseDate:  "2024-04-13",
-		PosterPath:   baseURL + "/api/metadata/agents/movies/v1.ufc-300/images/poster",
-		BackdropPath: baseURL + "/api/metadata/agents/movies/v1.ufc-300/images/fanart",
-	}, "movie", baseURL)
+func TestDefaultHubImageRPCResolvesBarePath(t *testing.T) {
+	server := &metadataServer{runtime: &runtimeServer{baseURL: defaultBaseURL}}
+	response, err := server.ResolveImageURL(context.Background(), &pluginv1.ResolveImageURLRequest{
+		Path: "/api/images/league/formula-1/poster",
+	})
 	if err != nil {
-		t.Fatalf("map Movie metadata item: %v", err)
+		t.Fatalf("resolve default-hub image: %v", err)
 	}
-
-	if got := item.GetReleaseDate(); got != "2024-04-13" {
-		t.Errorf("release date = %q, want 2024-04-13", got)
-	}
-	if got, want := item.GetPosterPath(), "sportarr:///api/metadata/agents/movies/v1.ufc-300/images/poster"; got != want {
-		t.Errorf("poster path = %q, want %q", got, want)
-	}
-	if got, want := item.GetBackdropPath(), "sportarr:///api/metadata/agents/movies/v1.ufc-300/images/fanart"; got != want {
-		t.Errorf("backdrop path = %q, want %q", got, want)
+	if got, want := response.GetUrl(), defaultBaseURL+"/api/images/league/formula-1/poster"; got != want {
+		t.Fatalf("resolved default-hub URL = %q, want %q", got, want)
 	}
 }
 
-func TestMovieImageRPCUsesCanonicalConfiguredLocalURLs(t *testing.T) {
+func TestConfiguredImageRPCAuthenticatesAndPreservesBasePath(t *testing.T) {
+	const apiKey = "sportarr-secret"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got, want := r.URL.Path, "/api/metadata/agents/movies/v1.ufc-300"; got != want {
-			t.Errorf("Movie detail path = %q, want %q", got, want)
+		if got, want := r.URL.Path, "/sportarr/api/v1/images/image-1"; got != want {
+			t.Errorf("image redirect path = %q, want %q", got, want)
 		}
-		if err := json.NewEncoder(w).Encode(provider.AgentMovieResponse{
-			PosterURL:   "/api/metadata/agents/movies/v1.ufc-300/images/poster",
-			BackdropURL: "/api/metadata/agents/movies/v1.ufc-300/images/fanart",
-			StillURL:    "/api/metadata/agents/movies/v1.ufc-300/images/still",
-		}); err != nil {
-			t.Errorf("encode Movie detail response: %v", err)
+		if got := r.Header.Get("X-Api-Key"); got != apiKey {
+			t.Errorf("X-Api-Key = %q, want configured key", got)
 		}
+		w.Header().Set("Location", "https://8.8.8.8/formula-1.jpg")
+		w.WriteHeader(http.StatusFound)
 	}))
 	defer srv.Close()
 
-	server := &metadataServer{runtime: &runtimeServer{
-		provider: provider.NewProvider(srv.URL),
-		baseURL:  srv.URL,
-	}}
-	providerIDs, err := stringStruct(map[string]string{"sportarr": "v1.ufc-300"})
-	if err != nil {
-		t.Fatalf("make provider IDs: %v", err)
-	}
-	response, err := server.GetImages(context.Background(), &pluginv1.GetImagesRequest{
-		ItemType:    "movie",
-		ProviderId:  "v1.ufc-300",
-		ProviderIds: providerIDs,
+	configured, err := structpb.NewStruct(map[string]any{
+		"base_url": srv.URL + "/sportarr/",
+		"api_key":  "  " + apiKey + "  ",
 	})
 	if err != nil {
-		t.Fatalf("get Movie images: %v", err)
+		t.Fatalf("make Sportarr config: %v", err)
 	}
-
-	want := map[string]string{
-		"poster":   "sportarr:///api/metadata/agents/movies/v1.ufc-300/images/poster",
-		"backdrop": "sportarr:///api/metadata/agents/movies/v1.ufc-300/images/fanart",
-		"still":    "sportarr:///api/metadata/agents/movies/v1.ufc-300/images/still",
+	runtime := &runtimeServer{}
+	if _, err := runtime.Configure(context.Background(), &pluginv1.ConfigureRequest{Config: []*pluginv1.ConfigEntry{{Key: "sportarr", Value: configured}}}); err != nil {
+		t.Fatalf("configure: %v", err)
 	}
-	if len(response.GetImages()) != len(want) {
-		t.Fatalf("Movie image count = %d, want %d", len(response.GetImages()), len(want))
+	server := &metadataServer{runtime: runtime}
+	response, err := server.ResolveImageURL(context.Background(), &pluginv1.ResolveImageURLRequest{
+		// Silo strips sportarr:// before invoking the plugin resolver.
+		Path: "/api/v1/images/image-1",
+	})
+	if err != nil {
+		t.Fatalf("resolve configured image: %v", err)
 	}
-	for _, image := range response.GetImages() {
-		wantURL, ok := want[image.GetKind()]
-		if !ok {
-			t.Errorf("unexpected or duplicate Movie image kind %q", image.GetKind())
-			continue
-		}
-		if image.GetUrl() != wantURL {
-			t.Errorf("Movie %s URL = %q, want %q", image.GetKind(), image.GetUrl(), wantURL)
-		}
-		resolved, err := server.ResolveImageURL(context.Background(), &pluginv1.ResolveImageURLRequest{Path: image.GetUrl()})
-		if err != nil {
-			t.Fatalf("resolve Movie %s URL: %v", image.GetKind(), err)
-		}
-		if got, want := resolved.GetUrl(), srv.URL+strings.TrimPrefix(wantURL, "sportarr://"); got != want {
-			t.Errorf("resolved Movie %s URL = %q, want %q", image.GetKind(), got, want)
-		}
-		delete(want, image.GetKind())
-	}
-	if len(want) != 0 {
-		t.Errorf("missing Movie image kinds: %v", want)
+	if got, want := response.GetUrl(), "https://8.8.8.8/formula-1.jpg"; got != want {
+		t.Fatalf("resolved configured URL = %q, want %q", got, want)
 	}
 }
 

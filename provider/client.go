@@ -18,6 +18,7 @@ import (
 
 const (
 	defaultBaseURL  = "https://sportarr.net"
+	apiKeyHeader    = "X-Api-Key"
 	maxRetries      = 3
 	maxResponseBody = 2 << 20 // 2 MB
 )
@@ -25,18 +26,9 @@ const (
 type Client struct {
 	httpClient *http.Client
 	baseURL    string
+	apiKey     string
 	limiter    *rate.Limiter
 	lookupIP   func(context.Context, string) ([]net.IP, error)
-}
-
-// ErrNotFound reports a 404 from Sportarr without treating other 4xx responses
-// as a missing resource.
-type ErrNotFound struct {
-	URL string
-}
-
-func (e *ErrNotFound) Error() string {
-	return fmt.Sprintf("sportarr: not found: %s", e.URL)
 }
 
 func NewClient(rateLimit int) *Client {
@@ -53,34 +45,16 @@ func NewClient(rateLimit int) *Client {
 	}
 }
 
-func (c *Client) SetBaseURL(url string) {
-	c.baseURL = url
+func (c *Client) SetBaseURL(baseURL string) {
+	c.baseURL = strings.TrimRight(baseURL, "/")
 }
 
-func (c *Client) localMovieAPIConfigured() bool {
-	endpoint, err := url.Parse(c.baseURL)
-	if err != nil || endpoint.Hostname() == "" {
-		return false
-	}
+func (c *Client) SetAPIKey(apiKey string) {
+	c.apiKey = strings.TrimSpace(apiKey)
+}
 
-	scheme := strings.ToLower(endpoint.Scheme)
-	host := strings.TrimSuffix(strings.ToLower(endpoint.Hostname()), ".")
-	effectivePort := endpoint.Port()
-	if effectivePort == "" {
-		switch scheme {
-		case "http":
-			effectivePort = "80"
-		case "https":
-			effectivePort = "443"
-		}
-	}
-
-	// The Movie agent API is instance-local, never the public Sportarr hub.
-	// Reject its hostname regardless of HTTP scheme or explicit/default port.
-	if (scheme == "http" || scheme == "https") && host == "sportarr.net" && effectivePort != "" {
-		return false
-	}
-	return true
+func (c *Client) hasAPIKey() bool {
+	return c.apiKey != ""
 }
 
 // SetHTTPClient replaces the request client. It is primarily useful for
@@ -89,12 +63,63 @@ func (c *Client) SetHTTPClient(httpClient *http.Client) {
 	c.httpClient = httpClient
 }
 
+func (c *Client) requestURL(path string) (string, error) {
+	if !strings.HasPrefix(path, "/api/") || strings.HasPrefix(path, "//") {
+		return "", fmt.Errorf("sportarr: request path must start with /api/")
+	}
+	requestPath, err := url.Parse(path)
+	if err != nil || requestPath.IsAbs() || requestPath.Host != "" || requestPath.User != nil || requestPath.Fragment != "" {
+		return "", fmt.Errorf("sportarr: invalid request path")
+	}
+	if !strings.HasPrefix(requestPath.Path, "/api/") || strings.Contains(requestPath.Path, `\`) {
+		return "", fmt.Errorf("sportarr: invalid request path")
+	}
+	for _, segment := range strings.Split(requestPath.Path, "/") {
+		if segment == "." || segment == ".." {
+			return "", fmt.Errorf("sportarr: invalid request path")
+		}
+	}
+
+	base, err := url.Parse(c.baseURL)
+	if err != nil || base.Host == "" || base.User != nil || base.RawQuery != "" || base.Fragment != "" || base.Opaque != "" {
+		return "", fmt.Errorf("sportarr: invalid base URL")
+	}
+	switch strings.ToLower(base.Scheme) {
+	case "http", "https":
+	default:
+		return "", fmt.Errorf("sportarr: base URL must use HTTP or HTTPS")
+	}
+
+	// Concatenating the validated absolute API path keeps a configured reverse-
+	// proxy prefix (for example /sportarr) instead of replacing it.
+	requestURL := strings.TrimRight(c.baseURL, "/") + path
+	if _, err := url.ParseRequestURI(requestURL); err != nil {
+		return "", fmt.Errorf("sportarr: invalid request URL: %w", err)
+	}
+	return requestURL, nil
+}
+
+func (c *Client) requestClient() http.Client {
+	client := *c.httpClient
+	// JSON endpoints must not redirect: following an unexpected cross-origin
+	// redirect could disclose the instance API key. Image redirects are handled
+	// separately and are deliberately inspected without being followed.
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return client
+}
+
 func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 	if err := c.limiter.Wait(ctx); err != nil {
 		return err
 	}
 
-	reqURL := c.baseURL + path
+	reqURL, err := c.requestURL(path)
+	if err != nil {
+		return err
+	}
+	client := c.requestClient()
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
@@ -105,8 +130,11 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 		req.Header.Set("User-Agent", "silo-plugin-sportarr/1.0")
 		req.Header.Set("Cache-Control", "no-cache, no-store")
 		req.Header.Set("Pragma", "no-cache")
+		if c.apiKey != "" {
+			req.Header.Set(apiKeyHeader, c.apiKey)
+		}
 
-		resp, err := c.httpClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			return fmt.Errorf("sportarr: request failed: %w", err)
 		}
@@ -141,15 +169,14 @@ func (c *Client) doGet(ctx context.Context, path string, dest any) error {
 			return fmt.Errorf("sportarr: server error %d after %d retries", resp.StatusCode, maxRetries)
 		}
 
-		if resp.StatusCode == http.StatusNotFound {
-			_ = resp.Body.Close()
-			return &ErrNotFound{URL: reqURL}
-		}
-
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody))
 			_ = resp.Body.Close()
 			return fmt.Errorf("sportarr: HTTP %d: %s", resp.StatusCode, string(body))
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			_ = resp.Body.Close()
+			return fmt.Errorf("sportarr: unexpected HTTP %d", resp.StatusCode)
 		}
 
 		decodeErr := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBody)).Decode(dest)
@@ -174,27 +201,6 @@ func retryAfterOrDefault(resp *http.Response, attempt int) time.Duration {
 func (c *Client) Search(ctx context.Context, title string) (*AgentSearchResponse, error) {
 	path := "/api/metadata/agents/search?title=" + url.QueryEscape(title)
 	var resp AgentSearchResponse
-	if err := c.doGet(ctx, path, &resp); err != nil {
-		return nil, err
-	}
-	return &resp, nil
-}
-
-func (c *Client) SearchMovies(ctx context.Context, title string, year int) (*AgentMovieSearchResponse, error) {
-	path := "/api/metadata/agents/movies/search?" + url.Values{
-		"title": []string{title},
-		"year":  []string{strconv.Itoa(year)},
-	}.Encode()
-	var resp AgentMovieSearchResponse
-	if err := c.doGet(ctx, path, &resp); err != nil {
-		return nil, err
-	}
-	return &resp, nil
-}
-
-func (c *Client) GetMovie(ctx context.Context, providerID string) (*AgentMovieResponse, error) {
-	path := "/api/metadata/agents/movies/" + url.PathEscape(providerID)
-	var resp AgentMovieResponse
 	if err := c.doGet(ctx, path, &resp); err != nil {
 		return nil, err
 	}
@@ -285,24 +291,19 @@ func (c *Client) ResolveImageRedirect(ctx context.Context, path string) (string,
 		return "", err
 	}
 
-	endpoint, err := url.Parse(c.baseURL)
+	reqURL, err := c.requestURL(path)
 	if err != nil {
-		return "", fmt.Errorf("sportarr: parse base URL: %w", err)
+		return "", err
 	}
-	imagePath, err := url.Parse(path)
-	if err != nil || imagePath.IsAbs() || imagePath.Host != "" {
-		return "", fmt.Errorf("sportarr: invalid image redirect path")
-	}
-	reqURL := endpoint.ResolveReference(imagePath)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("sportarr: create image redirect request: %w", err)
 	}
-
-	client := *c.httpClient
-	client.CheckRedirect = func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
+	if c.apiKey != "" {
+		req.Header.Set(apiKeyHeader, c.apiKey)
 	}
+
+	client := c.requestClient()
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("sportarr: image redirect request failed: %w", err)

@@ -3,115 +3,13 @@ package provider
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
-
-func TestSearchMoviesEncodesTitleAndYear(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/metadata/agents/movies/search" {
-			t.Errorf("unexpected path: %s", r.URL.Path)
-		}
-		if got := r.URL.Query().Get("title"); got != "UFC & WWE: 300" {
-			t.Errorf("unexpected title query: %q", got)
-		}
-		if got := r.URL.Query().Get("year"); got != "2024" {
-			t.Errorf("unexpected year query: %q", got)
-		}
-		if err := json.NewEncoder(w).Encode(AgentMovieSearchResponse{Results: []AgentMovieSearchResult{{
-			ID:          "v1.event-key",
-			Title:       "UFC 300",
-			Year:        2024,
-			ReleaseDate: "2024-04-13",
-			Summary:     "A title fight card.",
-			Studio:      "UFC",
-			PosterURL:   "https://sportarr.local/api/metadata/agents/movies/v1.event-key/images/poster",
-		}}}); err != nil {
-			t.Errorf("encode Movie search response: %v", err)
-		}
-	}))
-	defer srv.Close()
-
-	c := NewClient(100)
-	c.SetBaseURL(srv.URL)
-
-	resp, err := c.SearchMovies(context.Background(), "UFC & WWE: 300", 2024)
-	if err != nil {
-		t.Fatalf("search movies failed: %v", err)
-	}
-	if len(resp.Results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(resp.Results))
-	}
-	if got := resp.Results[0]; got.ID != "v1.event-key" || got.ReleaseDate != "2024-04-13" || got.Studio != "UFC" {
-		t.Errorf("unexpected movie result: %+v", got)
-	}
-}
-
-func TestGetMovieParsesTypedArtwork(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/metadata/agents/movies/v1.event-key" {
-			t.Errorf("unexpected path: %s", r.URL.Path)
-		}
-		if err := json.NewEncoder(w).Encode(AgentMovieResponse{
-			ID:          "v1.event-key",
-			Title:       "UFC 300",
-			SortTitle:   "UFC 300",
-			Year:        2024,
-			ReleaseDate: "2024-04-13",
-			Summary:     "A title fight card.",
-			Studio:      "UFC",
-			Genres:      []string{"MMA", "Sports"},
-			PosterURL:   "https://sportarr.local/api/metadata/agents/movies/v1.event-key/images/poster",
-			BackdropURL: "https://sportarr.local/api/metadata/agents/movies/v1.event-key/images/backdrop",
-			StillURL:    "https://sportarr.local/api/metadata/agents/movies/v1.event-key/images/still",
-		}); err != nil {
-			t.Errorf("encode Movie detail response: %v", err)
-		}
-	}))
-	defer srv.Close()
-
-	c := NewClient(100)
-	c.SetBaseURL(srv.URL)
-
-	resp, err := c.GetMovie(context.Background(), "v1.event-key")
-	if err != nil {
-		t.Fatalf("get movie failed: %v", err)
-	}
-	if got := resp; got.ReleaseDate != "2024-04-13" || got.PosterURL == "" || got.BackdropURL == "" || got.StillURL == "" {
-		t.Errorf("expected typed movie artwork and release date, got %+v", got)
-	}
-}
-
-func TestGetMovieReturnsTypedNotFoundOnlyFor404(t *testing.T) {
-	for _, tt := range []struct {
-		name         string
-		status       int
-		wantNotFound bool
-	}{
-		{name: "not found", status: http.StatusNotFound, wantNotFound: true},
-		{name: "bad request", status: http.StatusBadRequest, wantNotFound: false},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(tt.status)
-			}))
-			defer srv.Close()
-
-			c := NewClient(100)
-			c.SetBaseURL(srv.URL)
-			_, err := c.GetMovie(context.Background(), "v1.missing")
-			if err == nil {
-				t.Fatal("expected an error")
-			}
-			var notFound *ErrNotFound
-			if got := errors.As(err, &notFound); got != tt.wantNotFound {
-				t.Errorf("errors.As(ErrNotFound) = %v, want %v; error: %v", got, tt.wantNotFound, err)
-			}
-		})
-	}
-}
 
 func TestSearchParsesResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -179,6 +77,26 @@ func TestGetSeriesParsesResponse(t *testing.T) {
 	}
 	if len(resp.Genres) != 2 {
 		t.Errorf("expected 2 genres, got %d", len(resp.Genres))
+	}
+}
+
+func TestGetSeasonsParsesReleasedAgentArtworkFields(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/metadata/agents/series/formula-1/seasons" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		_, _ = io.WriteString(w, `{"seasons":[{"season_number":2026,"title":"2026","poster_url":"https://images.example/f1-2026.jpg","episode_count":24}]}`)
+	}))
+	defer srv.Close()
+
+	c := NewClient(100)
+	c.SetBaseURL(srv.URL)
+	resp, err := c.GetSeasons(context.Background(), "formula-1")
+	if err != nil {
+		t.Fatalf("get seasons: %v", err)
+	}
+	if len(resp.Seasons) != 1 || resp.Seasons[0].Title != "2026" || resp.Seasons[0].PosterURL != "https://images.example/f1-2026.jpg" {
+		t.Fatalf("unexpected released season response: %+v", resp.Seasons)
 	}
 }
 
@@ -275,9 +193,13 @@ func TestNoCacheHeaders(t *testing.T) {
 }
 
 func TestGetEntityImagesParsesResponse(t *testing.T) {
+	const apiKey = "sportarr-secret"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/v1/images/entity/league/abc-123" {
+		if r.URL.Path != "/sportarr/api/v1/images/entity/league/abc-123" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if got := r.Header.Get(apiKeyHeader); got != apiKey {
+			t.Errorf("X-Api-Key = %q, want configured key", got)
 		}
 		if r.URL.Query().Get("completed_only") != "true" {
 			t.Errorf("expected completed_only=true, got %s", r.URL.Query().Get("completed_only"))
@@ -305,7 +227,8 @@ func TestGetEntityImagesParsesResponse(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(10)
-	c.SetBaseURL(srv.URL)
+	c.SetBaseURL(srv.URL + "/sportarr/")
+	c.SetAPIKey("  " + apiKey + "  ")
 
 	resp, err := c.GetEntityImages(context.Background(), "league", "abc-123")
 	if err != nil {
@@ -396,5 +319,92 @@ func TestGetEntityImagesBatchEmpty(t *testing.T) {
 	result := c.GetEntityImagesBatch(context.Background(), "season", nil)
 	if len(result) != 0 {
 		t.Errorf("expected empty map, got %d entries", len(result))
+	}
+}
+
+func TestJSONRequestDoesNotFollowRedirectWithAPIKey(t *testing.T) {
+	targetRequests := 0
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetRequests++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer target.Close()
+
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer source.Close()
+
+	c := NewClient(100)
+	c.SetBaseURL(source.URL)
+	c.SetAPIKey("sportarr-secret")
+	_, err := c.Search(context.Background(), "Formula 1")
+	if err == nil || !strings.Contains(err.Error(), "unexpected HTTP 302") {
+		t.Fatalf("redirected JSON request error = %v, want HTTP 302 rejection", err)
+	}
+	if targetRequests != 0 {
+		t.Fatalf("redirect target received %d requests; API key could have leaked", targetRequests)
+	}
+}
+
+func TestRequestURLRejectsTraversal(t *testing.T) {
+	c := NewClient(100)
+	c.SetBaseURL("http://sportarr.local/sportarr")
+	for _, path := range []string{
+		"/api/../admin",
+		"/api/%2e%2e/admin",
+		"/api/v1/%2E%2E/admin",
+		`/api/v1\..\admin`,
+	} {
+		t.Run(path, func(t *testing.T) {
+			if _, err := c.requestURL(path); err == nil {
+				t.Fatalf("requestURL(%q) accepted traversal", path)
+			}
+		})
+	}
+}
+
+func TestResolveImageRedirectAuthenticatesAndPreservesBasePath(t *testing.T) {
+	const apiKey = "sportarr-secret"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.URL.Path, "/sportarr/api/v1/images/image-1"; got != want {
+			t.Errorf("redirect request path = %q, want %q", got, want)
+		}
+		if got := r.Header.Get(apiKeyHeader); got != apiKey {
+			t.Errorf("X-Api-Key = %q, want configured key", got)
+		}
+		w.Header().Set("Location", "https://cdn.example/formula-1.jpg")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	c := NewClient(100)
+	c.SetBaseURL(srv.URL + "/sportarr/")
+	c.SetAPIKey(apiKey)
+	c.lookupIP = func(context.Context, string) ([]net.IP, error) {
+		return []net.IP{net.ParseIP("8.8.8.8")}, nil
+	}
+
+	got, err := c.ResolveImageRedirect(context.Background(), "/api/v1/images/image-1")
+	if err != nil {
+		t.Fatalf("resolve image redirect: %v", err)
+	}
+	if want := "https://cdn.example/formula-1.jpg"; got != want {
+		t.Fatalf("redirect target = %q, want %q", got, want)
+	}
+}
+
+func TestResolveImageRedirectRejectsPrivateTarget(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "https://127.0.0.1/formula-1.jpg")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	c := NewClient(100)
+	c.SetBaseURL(srv.URL)
+	_, err := c.ResolveImageRedirect(context.Background(), "/api/images/league/formula-1/poster")
+	if err == nil || !strings.Contains(err.Error(), "not globally routable") {
+		t.Fatalf("private redirect error = %v, want globally-routable rejection", err)
 	}
 }

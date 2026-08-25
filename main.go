@@ -99,10 +99,10 @@ func resolveOneSportarrPath(baseURL, path, _ string) string {
 type runtimeServer struct {
 	runtimedefault.Server
 
-	manifest *pluginv1.PluginManifest
-	provider *provider.Provider
-	baseURL  string
-	movieBaseURLConfigured bool
+	manifest          *pluginv1.PluginManifest
+	provider          *provider.Provider
+	baseURL           string
+	baseURLConfigured bool
 }
 
 type metadataServer struct {
@@ -119,7 +119,8 @@ func (s *runtimeServer) GetManifest(context.Context, *pluginv1.GetManifestReques
 
 func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequest) (*pluginv1.ConfigureResponse, error) {
 	baseURL := defaultBaseURL
-	movieBaseURLConfigured := false
+	baseURLConfigured := false
+	apiKey := ""
 
 	for _, entry := range req.GetConfig() {
 		if entry.GetKey() != "sportarr" {
@@ -130,15 +131,23 @@ func (s *runtimeServer) Configure(_ context.Context, req *pluginv1.ConfigureRequ
 			if u, ok := m["base_url"].(string); ok {
 				if u = strings.TrimSpace(u); u != "" {
 					baseURL = strings.TrimRight(u, "/")
-					movieBaseURLConfigured = true
+					baseURLConfigured = true
 				}
+			}
+			if key, ok := m["api_key"].(string); ok {
+				apiKey = strings.TrimSpace(key)
 			}
 		}
 	}
 
 	s.baseURL = baseURL
-	s.movieBaseURLConfigured = movieBaseURLConfigured
-	s.provider = provider.NewProvider(baseURL)
+	s.baseURLConfigured = baseURLConfigured
+	if !baseURLConfigured {
+		// The key belongs to a self-hosted Sportarr instance. Never send it to
+		// the default public hub when no instance URL was explicitly selected.
+		apiKey = ""
+	}
+	s.provider = provider.NewProviderWithAPIKey(baseURL, apiKey)
 	return &pluginv1.ConfigureResponse{}, nil
 }
 
@@ -325,11 +334,8 @@ func (s *metadataServer) ResolveImageURLs(ctx context.Context, req *pluginv1.Res
 }
 
 func (s *metadataServer) resolveImageURL(ctx context.Context, path, variant string) string {
-	if !strings.HasPrefix(path, "/api/") {
+	if !strings.HasPrefix(path, "/api/") || !s.runtime.baseURLConfigured {
 		return resolveOneSportarrPath(s.runtime.baseURL, path, variant)
-	}
-	if !s.runtime.movieBaseURLConfigured {
-		return ""
 	}
 	p, err := s.runtime.providerForRequest()
 	if err != nil {
@@ -399,7 +405,6 @@ func metadataItemFromResult(result *metadata.MetadataResult, itemType, baseURL s
 		OriginalTitle:    result.OriginalTitle,
 		SortTitle:        result.SortTitle,
 		Year:             int32(result.Year),
-		ReleaseDate:      result.ReleaseDate,
 		Overview:         result.Overview,
 		Tagline:          result.Tagline,
 		Runtime:          int32(result.Runtime),
